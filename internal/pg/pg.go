@@ -137,6 +137,35 @@ func (s *session) Handshake() (wire.Startup, error) {
 	}
 }
 
+// Prime runs one statement on the upstream and consumes its response, before
+// Frontend and Backend start, so it needs no locking. It fails if the upstream
+// reports an error, so a failed read-only setup tears the session down.
+func (s *session) Prime(sql string) error {
+	if err := writeMessage(s.uw, typeQuery, append([]byte(sql), 0)); err != nil {
+		return err
+	}
+	if err := flush(s.uw); err != nil {
+		return err
+	}
+
+	for {
+		typ, body, err := readMessage(s.ur, maxAuthMessage)
+		if err != nil {
+			return fmt.Errorf("read upstream during prime: %w", err)
+		}
+		switch typ {
+		case typeErrorResponse:
+			return fmt.Errorf("prime %q: %s", sql, errorMessage(body))
+		case typeReadyForQuery:
+			if len(body) == 1 {
+				s.tx = body[0]
+			}
+
+			return nil
+		}
+	}
+}
+
 // Frontend relays client messages, consulting h for every statement. Extended
 // messages are held until their Sync so a batch can be accepted or rejected as
 // a unit. Output is flushed whenever the client has nothing more buffered.

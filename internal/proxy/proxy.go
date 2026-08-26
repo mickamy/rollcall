@@ -114,14 +114,23 @@ func (s Server) handle(ctx context.Context, client net.Conn) {
 	}
 
 	logger = logger.With("user", startup.User, "database", startup.Database, "application", startup.Application)
-	logger.Info("session opened")
 
-	handler := s.Guard.Resolve(startup)
+	enforcement := s.Guard.Resolve(startup)
+	for _, stmt := range enforcement.Prime {
+		if err := sess.Prime(stmt); err != nil {
+			if ctx.Err() == nil {
+				logger.Warn("prime", "error", err)
+			}
+
+			return
+		}
+	}
+	logger.Info("session opened")
 
 	var wg sync.WaitGroup
 	var toUpstream, toClient error
 	wg.Go(func() {
-		toUpstream = sess.Frontend(handler)
+		toUpstream = sess.Frontend(enforcement.Handler)
 		closeWrite(upstream)
 	})
 	wg.Go(func() {

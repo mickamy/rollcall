@@ -1,6 +1,7 @@
 package policy_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -44,50 +45,70 @@ func TestParseRejectsUnknownFieldsAndFailValues(t *testing.T) {
 	}
 }
 
-func TestResolveReadOnlyDeniesWrites(t *testing.T) {
+func TestReadOnlyRolePrimesAndDeniesWrites(t *testing.T) {
 	t.Parallel()
 
-	p := load(t, `
-roles:
-  agent_ops:
-    read_only: true
-`)
-	h := p.Resolve(wire.Startup{User: "agent_ops"})
+	p := load(t, "roles:\n  agent_ops:\n    read_only: true\n")
+	enf := p.Resolve(wire.Startup{User: "agent_ops"})
 
-	if v := h.Statement(wire.Statement{SQL: "select * from t"}); v.Deny {
+	if !slices.Contains(enf.Prime, "SET default_transaction_read_only = on") {
+		t.Errorf("Prime: got %v, want it to set the read-only transaction default", enf.Prime)
+	}
+
+	if v := deny(enf, "select id from t"); v.Deny {
 		t.Errorf("select: got denied (%q), want allowed", v.Message)
 	}
 
-	v := h.Statement(wire.Statement{SQL: "update t set x = 1"})
-	if !v.Deny {
-		t.Fatal("update: got allowed, want denied")
-	}
-	if !strings.Contains(v.Message, "UPDATE") || !strings.Contains(v.Message, "read-only") {
-		t.Errorf("update denial message: got %q", v.Message)
+	v := deny(enf, "update t set x = 1")
+	if !v.Deny || !strings.Contains(v.Message, "UPDATE") {
+		t.Errorf("update: got %+v, want a read-only denial naming UPDATE", v)
 	}
 }
 
-func TestResolveWritableRoleAllowsEverything(t *testing.T) {
+func TestReadOnlyRoleDeniesEscapeHatches(t *testing.T) {
+	t.Parallel()
+
+	p := load(t, "roles:\n  agent_ops:\n    read_only: true\n")
+	enf := p.Resolve(wire.Startup{User: "agent_ops"})
+
+	hatches := []string{
+		"set default_transaction_read_only = off",
+		`set "default_transaction_read_only" = off`,
+		"begin read write",
+		"select set_config('default_transaction_read_only','off',false)",
+	}
+	for _, sql := range hatches {
+		v := deny(enf, sql)
+		if !v.Deny || !strings.Contains(v.Message, "read-write") {
+			t.Errorf("escape hatch %q: got %+v, want a read-write denial", sql, v)
+		}
+	}
+}
+
+func TestWritableRoleAllowsEverythingAndDoesNotPrime(t *testing.T) {
 	t.Parallel()
 
 	p := load(t, "roles:\n  app_rw:\n    agent: web\n")
-	h := p.Resolve(wire.Startup{User: "app_rw"})
+	enf := p.Resolve(wire.Startup{User: "app_rw"})
 
-	if v := h.Statement(wire.Statement{SQL: "delete from t"}); v.Deny {
+	if len(enf.Prime) != 0 {
+		t.Errorf("Prime: got %v, want none for a writable role", enf.Prime)
+	}
+	if v := deny(enf, "delete from t"); v.Deny {
 		t.Errorf("delete for a writable role: got denied (%q), want allowed", v.Message)
 	}
 }
 
-func TestResolveUnknownRoleHonorsFailMode(t *testing.T) {
+func TestUnlistedRoleHonorsFailMode(t *testing.T) {
 	t.Parallel()
 
 	open := load(t, "roles: {}\n")
-	if v := open.Resolve(wire.Startup{User: "ghost"}).Statement(wire.Statement{SQL: "delete from t"}); v.Deny {
+	if v := deny(open.Resolve(wire.Startup{User: "ghost"}), "delete from t"); v.Deny {
 		t.Errorf("fail-open unknown role: got denied (%q), want allowed", v.Message)
 	}
 
 	closed := load(t, "fail: closed\nroles: {}\n")
-	v := closed.Resolve(wire.Startup{User: "ghost"}).Statement(wire.Statement{SQL: "select 1"})
+	v := deny(closed.Resolve(wire.Startup{User: "ghost"}), "select 1")
 	if !v.Deny || !strings.Contains(v.Message, "ghost") {
 		t.Errorf("fail-closed unknown role: got %+v, want a denial naming the role", v)
 	}
@@ -97,9 +118,13 @@ func TestZeroPolicyAllowsEverything(t *testing.T) {
 	t.Parallel()
 
 	var p policy.Policy
-	if v := p.Resolve(wire.Startup{User: "anyone"}).Statement(wire.Statement{SQL: "drop table t"}); v.Deny {
+	if v := deny(p.Resolve(wire.Startup{User: "anyone"}), "drop table t"); v.Deny {
 		t.Errorf("zero policy: got denied (%q), want allowed", v.Message)
 	}
+}
+
+func deny(enf wire.Enforcement, sql string) wire.Verdict {
+	return enf.Handler.Statement(wire.Statement{SQL: sql})
 }
 
 func load(t *testing.T, src string) policy.Policy {

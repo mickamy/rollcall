@@ -145,6 +145,10 @@ func (rawSession) Handshake() (wire.Startup, error) {
 	return wire.Startup{User: "raw"}, nil
 }
 
+func (rawSession) Prime(string) error {
+	return nil
+}
+
 func (s rawSession) Frontend(wire.Handler) error {
 	if _, err := io.Copy(s.upstream, s.client); err != nil {
 		return fmt.Errorf("frontend: %w", err)

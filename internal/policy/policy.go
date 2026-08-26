@@ -14,6 +14,11 @@ import (
 	"github.com/mickamy/rollcall/internal/wire"
 )
 
+// readOnlyPrime is run on the upstream for a read-only role. It makes the server
+// refuse every write, including writes performed through functions such as
+// nextval, which the statement classifier cannot see.
+const readOnlyPrime = "SET default_transaction_read_only = on"
+
 // Policy decides what each database role may do. The zero value denies nothing;
 // load a file to enforce rules.
 type Policy struct {
@@ -85,41 +90,62 @@ func parseFail(s string) (bool, error) {
 	}
 }
 
-// Resolve returns the handler for a session, binding the rules of the role that
-// matches the connection's database user.
-func (p Policy) Resolve(startup wire.Startup) wire.Handler {
+// Resolve returns the enforcement for a session, binding the rules of the role
+// that matches the connection's database user.
+func (p Policy) Resolve(startup wire.Startup) wire.Enforcement {
 	role, ok := p.Roles[startup.User]
 	if !ok {
-		if p.FailClosed {
-			return wire.HandlerFunc(func(wire.Statement) wire.Verdict {
-				return wire.Verdict{
-					Deny:    true,
-					Message: fmt.Sprintf("no policy for role %q", startup.User),
-					Hint:    "add the role to the policy, or connect as a configured role",
-				}
-			})
-		}
-
-		return wire.HandlerFunc(func(wire.Statement) wire.Verdict { return wire.Verdict{} })
+		return p.unlisted(startup.User)
 	}
 
-	return wire.HandlerFunc(role.evaluate)
+	if !role.ReadOnly {
+		return wire.Enforcement{Handler: allow()}
+	}
+
+	return wire.Enforcement{
+		Prime:   []string{readOnlyPrime},
+		Handler: wire.HandlerFunc(readOnly),
+	}
 }
 
-func (r Role) evaluate(stmt wire.Statement) wire.Verdict {
-	if !r.ReadOnly {
-		return wire.Verdict{}
+func (p Policy) unlisted(user string) wire.Enforcement {
+	if !p.FailClosed {
+		return wire.Enforcement{Handler: allow()}
 	}
 
-	for _, kind := range sqlscan.Classify(stmt.SQL) {
-		if kind.Mutating() {
+	return wire.Enforcement{Handler: wire.HandlerFunc(func(wire.Statement) wire.Verdict {
+		return wire.Verdict{
+			Deny:    true,
+			Message: fmt.Sprintf("no policy for role %q", user),
+			Hint:    "add the role to the policy, or connect as a configured role",
+		}
+	})}
+}
+
+// readOnly denies statements that write or that could turn read-only mode off.
+// The server-side read-only transaction is the real guarantee; this gives a
+// clear, early refusal and stops the client from disabling it.
+func readOnly(stmt wire.Statement) wire.Verdict {
+	for _, f := range sqlscan.Scan(stmt.SQL) {
+		if f.DisablesReadOnly {
 			return wire.Verdict{
 				Deny:    true,
-				Message: fmt.Sprintf("%s is not allowed: this connection is read-only", kind),
-				Hint:    "run the statement as a role that permits writes, or request approval",
+				Message: "changing this connection to read-write is not allowed",
+				Hint:    "this connection is read-only; use a role that permits writes",
+			}
+		}
+		if f.Kind.Mutating() {
+			return wire.Verdict{
+				Deny:    true,
+				Message: fmt.Sprintf("%s is not allowed: this connection is read-only", f.Kind),
+				Hint:    "use a role that permits writes, or request approval",
 			}
 		}
 	}
 
 	return wire.Verdict{}
+}
+
+func allow() wire.Handler {
+	return wire.HandlerFunc(func(wire.Statement) wire.Verdict { return wire.Verdict{} })
 }
