@@ -9,21 +9,34 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/mickamy/rollcall/internal/wire"
 )
 
 const (
-	dialTimeout    = 10 * time.Second
-	minAcceptDelay = 5 * time.Millisecond
-	maxAcceptDelay = time.Second
+	dialTimeout      = 10 * time.Second
+	handshakeTimeout = 30 * time.Second
+	minAcceptDelay   = 5 * time.Millisecond
+	maxAcceptDelay   = time.Second
 )
 
-// Server relays every accepted connection to Upstream byte for byte.
+// Server accepts client connections and drives each one through Dialect
+// against a connection to Upstream.
 type Server struct {
 	Upstream string
-	Logger   *slog.Logger
+	Dialect  wire.Dialect
+	// Handler decides each statement; nil allows everything.
+	Handler wire.Handler
+	Logger  *slog.Logger
 }
 
 func (s Server) Serve(ctx context.Context, ln net.Listener) error {
+	if s.Dialect == nil {
+		return errors.New("proxy: Dialect is required")
+	}
+	if s.Handler == nil {
+		s.Handler = wire.HandlerFunc(func(wire.Statement) wire.Verdict { return wire.Verdict{} })
+	}
 	if s.Logger == nil {
 		s.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -83,12 +96,35 @@ func (s Server) handle(ctx context.Context, client net.Conn) {
 	})
 	defer stop()
 
-	logger.Debug("session opened")
+	sess := s.Dialect.NewSession(client, upstream)
+	startup, err := handshake(sess, client, upstream)
+	if err != nil {
+		switch {
+		case ctx.Err() != nil:
+		case errors.Is(err, wire.ErrNoSession):
+			logger.Debug("out-of-band request relayed")
+		case errors.Is(err, wire.ErrRejected):
+			logger.Info("session rejected", "user", startup.User, "database", startup.Database, "error", err)
+		default:
+			logger.Warn("handshake", "error", err)
+		}
+
+		return
+	}
+
+	logger = logger.With("user", startup.User, "database", startup.Database, "application", startup.Application)
+	logger.Info("session opened")
 
 	var wg sync.WaitGroup
 	var toUpstream, toClient error
-	wg.Go(func() { toUpstream = relay(upstream, client) })
-	wg.Go(func() { toClient = relay(client, upstream) })
+	wg.Go(func() {
+		toUpstream = sess.Frontend(s.Handler)
+		closeWrite(upstream)
+	})
+	wg.Go(func() {
+		toClient = sess.Backend()
+		closeWrite(client)
+	})
 	wg.Wait()
 
 	for _, err := range []error{toUpstream, toClient} {
@@ -97,29 +133,44 @@ func (s Server) handle(ctx context.Context, client net.Conn) {
 		}
 	}
 
-	logger.Debug("session closed")
+	logger.Info("session closed")
+}
+
+// handshake bounds the handshake with a deadline on both connections and lifts
+// it again once the session is established.
+func handshake(sess wire.Session, conns ...net.Conn) (wire.Startup, error) {
+	deadline := time.Now().Add(handshakeTimeout)
+	for _, c := range conns {
+		_ = c.SetDeadline(deadline)
+	}
+
+	startup, err := sess.Handshake()
+
+	for _, c := range conns {
+		_ = c.SetDeadline(time.Time{})
+	}
+
+	if err != nil {
+		return startup, fmt.Errorf("handshake: %w", err)
+	}
+
+	return startup, nil
 }
 
 type closeWriter interface {
 	CloseWrite() error
 }
 
-// relay copies src to dst until src is done, then passes the end of stream on
-// to dst as a half-close so that dst's owner can still drain the other direction.
-func relay(dst, src net.Conn) error {
-	_, err := io.Copy(dst, src)
-
-	if cw, ok := dst.(closeWriter); ok {
+// closeWrite passes the end of one direction on as a half-close so that the
+// peer can still drain the other direction.
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(closeWriter); ok {
 		_ = cw.CloseWrite()
-	} else {
-		_ = dst.Close()
+
+		return
 	}
 
-	if err != nil {
-		return fmt.Errorf("copy: %w", err)
-	}
-
-	return nil
+	_ = c.Close()
 }
 
 func abnormal(err error) bool {

@@ -21,7 +21,9 @@ Prebuilt binaries are on the [releases page](https://github.com/mickamy/rollcall
 
 ## Status
 
-Early development. `rollcall proxy` currently relays PostgreSQL connections unchanged; policy enforcement and the access ledger are being built on top of it.
+Early development. `rollcall proxy` speaks the PostgreSQL protocol: it relays authentication untouched, sees every statement on both the simple and the extended query protocol, and can refuse one before it reaches the server. The policy that decides what to refuse and the access ledger are being built on top of it; today everything is allowed.
+
+The proxy speaks plaintext on both sides and answers `SSLRequest` with `N`, so `sslmode=prefer` clients fall back to plaintext. Keep the listener on loopback or a pod-local network until TLS lands.
 
 ## Usage
 
