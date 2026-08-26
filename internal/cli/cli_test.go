@@ -39,35 +39,30 @@ func TestRun(t *testing.T) {
 			wantCode: exit.Usage,
 			wantErr:  `unknown command "bogus"`,
 		},
-		"hello with default name": {
-			args:     []string{"hello"},
+		"proxy help": {
+			args:     []string{"proxy", "-h"},
 			wantCode: exit.OK,
-			wantOut:  "Hello, world!\n",
+			wantOut:  "Usage: " + cli.Name + " proxy",
 		},
-		"hello with name": {
-			args:     []string{"hello", "-name", "Go"},
-			wantCode: exit.OK,
-			wantOut:  "Hello, Go!\n",
-		},
-		"hello help": {
-			args:     []string{"hello", "-h"},
-			wantCode: exit.OK,
-			wantOut:  "Usage: " + cli.Name + " hello",
-		},
-		"hello with unknown flag": {
-			args:     []string{"hello", "-bogus"},
+		"proxy with unknown flag": {
+			args:     []string{"proxy", "-bogus"},
 			wantCode: exit.Usage,
 			wantErr:  "flag provided but not defined: -bogus",
 		},
-		"hello with unexpected argument": {
-			args:     []string{"hello", "extra"},
+		"proxy with unexpected argument": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "extra"},
 			wantCode: exit.Usage,
 			wantErr:  `unexpected argument "extra"`,
 		},
-		"hello with empty name": {
-			args:     []string{"hello", "-name", ""},
+		"proxy without upstream": {
+			args:     []string{"proxy"},
 			wantCode: exit.Error,
-			wantErr:  cli.Name + ": name must not be empty\n",
+			wantErr:  cli.Name + ": -upstream is required\n",
+		},
+		"proxy with unlistenable address": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-listen", "127.0.0.1:port"},
+			wantCode: exit.Error,
+			wantErr:  cli.Name + ": listen tcp",
 		},
 	}
 
@@ -93,19 +88,20 @@ func TestRun(t *testing.T) {
 	}
 }
 
-func TestRunCanceled(t *testing.T) {
+func TestRunProxyStopsWhenCanceled(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	var out, errOut bytes.Buffer
-	code := cli.Run(ctx, []string{"hello"}, cli.IO{In: strings.NewReader(""), Out: &out, Err: &errOut})
+	args := []string{"proxy", "-upstream", "127.0.0.1:5432", "-listen", "127.0.0.1:0"}
+	code := cli.Run(ctx, args, cli.IO{In: strings.NewReader(""), Out: &out, Err: &errOut})
 
-	if code != exit.Error {
-		t.Errorf("exit code: got %d, want %d", code, exit.Error)
+	if code != exit.OK {
+		t.Errorf("exit code: got %d, want %d (stderr: %q)", code, exit.OK, errOut.String())
 	}
-	if !strings.Contains(errOut.String(), context.Canceled.Error()) {
-		t.Errorf("stderr: got %q, want it to mention %q", errOut.String(), context.Canceled)
+	if !strings.Contains(errOut.String(), "msg=listening") {
+		t.Errorf("stderr: got %q, want it to log that it listened", errOut.String())
 	}
 }

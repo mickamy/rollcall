@@ -21,8 +21,15 @@ Prebuilt binaries are on the [releases page](https://github.com/mickamy/rollcall
 
 ## Usage
 
+Start the proxy in front of a database and point your agent's connection at it:
+
 ```sh
-rollcall hello -name Go
+rollcall proxy -upstream 127.0.0.1:5432            # listens on 127.0.0.1:6432
+PGHOST=127.0.0.1 PGPORT=6432 psql -U agent_claude_ops prod
+```
+
+```sh
+rollcall proxy -h
 rollcall help
 rollcall version
 ```
