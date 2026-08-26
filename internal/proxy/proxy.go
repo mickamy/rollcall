@@ -25,17 +25,18 @@ const (
 type Server struct {
 	Upstream string
 	Dialect  wire.Dialect
-	// Handler decides each statement; nil allows everything.
-	Handler wire.Handler
-	Logger  *slog.Logger
+	// Guard resolves the per-session handler from the client's identity; nil
+	// allows everything.
+	Guard  wire.Guard
+	Logger *slog.Logger
 }
 
 func (s Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.Dialect == nil {
 		return errors.New("proxy: Dialect is required")
 	}
-	if s.Handler == nil {
-		s.Handler = wire.HandlerFunc(func(wire.Statement) wire.Verdict { return wire.Verdict{} })
+	if s.Guard == nil {
+		s.Guard = wire.AllowAll
 	}
 	if s.Logger == nil {
 		s.Logger = slog.New(slog.DiscardHandler)
@@ -115,10 +116,12 @@ func (s Server) handle(ctx context.Context, client net.Conn) {
 	logger = logger.With("user", startup.User, "database", startup.Database, "application", startup.Application)
 	logger.Info("session opened")
 
+	handler := s.Guard.Resolve(startup)
+
 	var wg sync.WaitGroup
 	var toUpstream, toClient error
 	wg.Go(func() {
-		toUpstream = sess.Frontend(s.Handler)
+		toUpstream = sess.Frontend(handler)
 		closeWrite(upstream)
 	})
 	wg.Go(func() {

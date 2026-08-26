@@ -85,6 +85,11 @@ func TestRun(t *testing.T) {
 			wantCode: exit.Error,
 			wantErr:  cli.Name + ": listen tcp",
 		},
+		"proxy with a missing policy file": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-policy", "/no/such/policy.yaml"},
+			wantCode: exit.Error,
+			wantErr:  cli.Name + ": read policy:",
+		},
 	}
 
 	for name, tt := range tests {
