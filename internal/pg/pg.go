@@ -24,15 +24,18 @@ const (
 	// batch can be rejected atomically; a batch larger than this is forwarded
 	// early (see stage) rather than buffered without limit.
 	maxPending = 8 << 20
-	// maxQueue bounds outstanding responses so a client cannot make the proxy
-	// accumulate denials faster than a slow upstream drains earlier requests.
+	// maxQueue bounds outstanding responses. Reaching it blocks the frontend
+	// until the backend drains one, applying backpressure like the server does.
 	maxQueue = 512
 	// smallBody bounds the messages Backend reads fully before taking the
 	// client write lock, so a stalled upstream cannot hold denials hostage.
 	smallBody = 32 << 10
 )
 
-var errQueueFull = errors.New("pending response queue is full")
+// errDeniedAfterForward ends a session when a statement is denied after part of
+// its batch already reached the upstream. Closing the connection makes the
+// upstream roll back the implicit transaction instead of committing at Sync.
+var errDeniedAfterForward = errors.New("statement denied after its batch was partially forwarded")
 
 type Dialect struct {
 	// MaxStatement caps the SQL text of a Query or Parse message; longer
@@ -48,7 +51,7 @@ func (d Dialect) NewSession(client, upstream net.Conn) wire.Session {
 		maxStatement = defaultMaxStatement
 	}
 
-	return &session{
+	s := &session{
 		maxStatement: maxStatement,
 		cr:           bufio.NewReaderSize(client, readBufferSize),
 		cw:           bufio.NewWriterSize(client, writeBufferSize),
@@ -56,14 +59,19 @@ func (d Dialect) NewSession(client, upstream net.Conn) wire.Session {
 		uw:           bufio.NewWriterSize(upstream, writeBufferSize),
 		small:        make([]byte, smallBody),
 	}
+	s.drained = sync.NewCond(&s.mu)
+
+	return s
 }
 
 // slot is one client request awaiting its answer, in request order. A
-// forwarded slot is settled by the upstream's ReadyForQuery, and may carry a
-// denial to emit just before that ReadyForQuery. A synthesized slot (not
-// forwarded) is written by the proxy once every slot ahead of it is answered.
+// forwarded slot is settled by the upstream's ReadyForQuery; simple marks the
+// simple query protocol, whose ReadyForQuery survives COPY. A synthesized slot
+// (not forwarded) is written by the proxy once every slot ahead of it is
+// answered.
 type slot struct {
 	forwarded bool
+	simple    bool
 	code      string
 	message   string
 	hint      string
@@ -79,7 +87,6 @@ type session struct {
 	pending   bytes.Buffer
 	forwarded bool // part of the current batch was already sent upstream
 	denied    bool // a statement in the current batch was denied
-	deferred  slot // a denial to report at Sync, when the batch was already forwarded
 
 	// Backend goroutine only.
 	ur    *bufio.Reader
@@ -87,10 +94,12 @@ type session struct {
 
 	// mu serializes writes to the client, which Frontend (denials) and Backend
 	// (forwarded messages) both perform, and guards tx and queue alongside them.
-	mu    sync.Mutex
-	cw    *bufio.Writer
-	tx    byte
-	queue []slot
+	// drained wakes the frontend when the backend frees a queue slot.
+	mu      sync.Mutex
+	drained *sync.Cond
+	cw      *bufio.Writer
+	tx      byte
+	queue   []slot
 }
 
 func (s *session) Handshake() (wire.Startup, error) {
@@ -177,9 +186,16 @@ func (s *session) Backend() error {
 			return fmt.Errorf("read upstream: %w", err)
 		}
 
-		if typ == typeReadyForQuery {
+		switch typ {
+		case typeReadyForQuery:
 			err = s.readyForQuery(n)
-		} else {
+		case typeCopyInResponse:
+			// The server ignores the batch's Sync while reading COPY data, so
+			// the extended-protocol slot for it will never be answered; drop it.
+			if err = s.forwardToClient(typ, n); err == nil {
+				s.copyInStarted()
+			}
+		default:
 			err = s.forwardToClient(typ, n)
 		}
 		if err != nil {
@@ -232,8 +248,7 @@ func (s *session) relayAuth() error {
 	}
 }
 
-// dispatch routes one client message. It reports whether the session is done
-// (the client asked to terminate).
+// dispatch routes one client message. It reports whether the session is done.
 func (s *session) dispatch(h wire.Handler, typ byte, n uint32) (bool, error) {
 	switch typ {
 	case typeQuery:
@@ -288,18 +303,17 @@ func (s *session) query(h wire.Handler, n uint32) error {
 		return s.respond(readySlot(denial(v)))
 	}
 
-	// Enqueue before the statement can reach the upstream, so Backend never
-	// sees the reply before the slot that accounts for it.
-	if err := s.enqueueSlot(slot{forwarded: true}); err != nil {
-		return err
-	}
+	// Enqueue before the statement can reach the upstream, so Backend never sees
+	// the reply before the slot that accounts for it. A simple query's
+	// ReadyForQuery survives COPY, so mark it.
+	s.enqueue(slot{forwarded: true, simple: true})
 
 	return writeMessage(s.uw, typeQuery, body)
 }
 
 // parse handles the extended protocol's Parse message, the one place where SQL
-// enters that path. A denial rejects the whole batch: earlier buffered
-// messages are dropped and later ones ignored until Sync.
+// enters that path. A denial rejects the whole batch: earlier buffered messages
+// are dropped and later ones ignored until Sync.
 func (s *session) parse(h wire.Handler, n uint32) error {
 	if s.denied {
 		return discard(s.cr, n)
@@ -389,32 +403,26 @@ func (s *session) flushBatch(n uint32) error {
 	return flush(s.uw)
 }
 
-// sync ends a batch. Whether or not it was denied, a Sync is sent upstream so
-// the client's ReadyForQuery comes from a real upstream response; a denial
-// deferred from an already-forwarded batch rides on that response.
+// sync ends a batch. A clean batch is forwarded together with its Sync; a
+// denied batch (which never forwarded anything) sends only a Sync so the
+// client's ReadyForQuery still comes from a real upstream response.
 func (s *session) sync(n uint32) error {
 	if err := discard(s.cr, n); err != nil {
 		return err
 	}
 
-	answer := slot{forwarded: true}
-	if s.denied {
-		answer.code = s.deferred.code
-		answer.message = s.deferred.message
-		answer.hint = s.deferred.hint
-	} else if err := s.forwardPending(); err != nil {
-		return err
+	if !s.denied {
+		if err := s.forwardPending(); err != nil {
+			return err
+		}
 	}
 
 	s.denied = false
 	s.forwarded = false
-	s.deferred = slot{}
 
 	// Enqueue before the Sync reaches the upstream, so Backend never sees the
 	// ReadyForQuery before the slot that accounts for it.
-	if err := s.enqueueSlot(answer); err != nil {
-		return err
-	}
+	s.enqueue(slot{forwarded: true})
 	if err := writeMessage(s.uw, typeSync, nil); err != nil {
 		return err
 	}
@@ -439,17 +447,17 @@ func (s *session) functionCall(n uint32) error {
 	}))
 }
 
-// denyBatch marks the batch rejected. When nothing has been forwarded the
-// denial is reported at once; otherwise it is deferred until the Sync so it
-// follows the responses the upstream still owes.
+// denyBatch rejects the current batch. When nothing has been forwarded it is
+// rejected atomically. When part of it already reached the upstream, the
+// session is torn down so the upstream rolls back rather than committing at Sync.
 func (s *session) denyBatch(sl slot) error {
 	s.denied = true
-	s.pending.Reset()
+	s.resetPending()
 
 	if s.forwarded {
-		s.deferred = sl
+		s.emitError(sl)
 
-		return nil
+		return errDeniedAfterForward
 	}
 
 	return s.respond(sl)
@@ -462,9 +470,20 @@ func (s *session) forwardPending() error {
 	if _, err := s.uw.Write(s.pending.Bytes()); err != nil {
 		return fmt.Errorf("forward buffered batch: %w", err)
 	}
-	s.pending.Reset()
+	s.resetPending()
 
 	return nil
+}
+
+// resetPending clears the buffer, dropping an oversized backing array so a
+// connection that saw one large batch does not hold that memory for its life.
+func (s *session) resetPending() {
+	if s.pending.Len() > maxPending {
+		s.pending = bytes.Buffer{}
+
+		return
+	}
+	s.pending.Reset()
 }
 
 // respond enqueues a synthesized answer and writes it, and any answers ahead of
@@ -473,10 +492,7 @@ func (s *session) respond(sl slot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.queue) >= maxQueue {
-		return errQueueFull
-	}
-	s.queue = append(s.queue, sl)
+	s.enqueueLocked(sl)
 
 	emitted := false
 	for len(s.queue) > 0 && !s.queue[0].forwarded {
@@ -487,22 +503,28 @@ func (s *session) respond(sl slot) error {
 		emitted = true
 	}
 	if emitted {
+		s.drained.Broadcast()
+
 		return flush(s.cw)
 	}
 
 	return nil
 }
 
-func (s *session) enqueueSlot(sl slot) error {
+func (s *session) enqueue(sl slot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.queue) >= maxQueue {
-		return errQueueFull
+	s.enqueueLocked(sl)
+}
+
+// enqueueLocked appends a slot, blocking while the queue is full so the client
+// is backpressured instead of dropped. Callers hold mu.
+func (s *session) enqueueLocked(sl slot) {
+	for len(s.queue) >= maxQueue {
+		s.drained.Wait()
 	}
 	s.queue = append(s.queue, sl)
-
-	return nil
 }
 
 // emit writes a synthesized answer. Callers hold mu.
@@ -519,6 +541,16 @@ func (s *session) emit(sl slot) error {
 	}
 
 	return nil
+}
+
+// emitError writes a denial straight to the client, best effort, for the
+// teardown path where the queue is about to be abandoned.
+func (s *session) emitError(sl slot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_ = writeMessage(s.cw, typeErrorResponse, errorResponse(sl.code, sl.message, sl.hint))
+	_ = flush(s.cw)
 }
 
 func (s *session) readyForQuery(n uint32) error {
@@ -544,15 +576,8 @@ func (s *session) readyForQuery(n uint32) error {
 		return fmt.Errorf("%w: ReadyForQuery without a pending request", errMalformed)
 	}
 
-	answer := s.queue[0]
 	s.queue = s.queue[1:]
 	s.tx = status[0]
-
-	if answer.code != "" {
-		if err := writeMessage(s.cw, typeErrorResponse, errorResponse(answer.code, answer.message, answer.hint)); err != nil {
-			return err
-		}
-	}
 	if err := writeMessage(s.cw, typeReadyForQuery, status[:]); err != nil {
 		return err
 	}
@@ -564,7 +589,22 @@ func (s *session) readyForQuery(n uint32) error {
 		s.queue = s.queue[1:]
 	}
 
+	s.drained.Broadcast()
+
 	return flush(s.cw)
+}
+
+// copyInStarted drops the extended-protocol Sync slot for a COPY, whose Sync the
+// server ignores while reading copy data. A simple query keeps its slot, since
+// its ReadyForQuery still arrives when the copy completes.
+func (s *session) copyInStarted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.queue) > 0 && s.queue[0].forwarded && !s.queue[0].simple {
+		s.queue = s.queue[1:]
+		s.drained.Broadcast()
+	}
 }
 
 func (s *session) forwardToClient(typ byte, n uint32) error {

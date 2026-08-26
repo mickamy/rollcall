@@ -42,6 +42,7 @@ const (
 	typeAuthentication = 'R'
 	typeErrorResponse  = 'E'
 	typeReadyForQuery  = 'Z'
+	typeCopyInResponse = 'G'
 )
 
 const (

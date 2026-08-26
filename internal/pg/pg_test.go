@@ -570,6 +570,144 @@ func TestFrontendRejectsFunctionCalls(t *testing.T) {
 	}
 }
 
+func TestExtendedCopyInDropsTheIgnoredSyncSlot(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+	frontend := p.frontend(denyContaining("delete"))
+
+	// Extended COPY FROM STDIN: the server ignores this batch's Sync while
+	// reading copy data and answers a later Sync instead, so two Syncs yield
+	// one ReadyForQuery. The proxy must not leave a phantom slot behind.
+	copyBatch := bytes.Join([][]byte{pMsg("copy t from stdin"), bindMsg, execMsg, syncMsg}, nil)
+	copyIn := msg('G', []byte{0}, be16(1), be16(0))
+	data := bytes.Join([][]byte{msg('d', []byte("1\n")), msg('c'), syncMsg}, nil)
+
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, copyBatch); err != nil {
+			return err
+		}
+		if err := write(s, msg('1'), msg('2'), copyIn); err != nil { // ParseComplete, BindComplete, CopyInResponse; no Z
+			return err
+		}
+		if err := expectBytes(s, data); err != nil {
+			return err
+		}
+
+		return write(s, msg('C', cstr("COPY 1")), msg('Z', []byte("I"))) // one Z for the second Sync
+	})
+
+	mustWrite(t, p.client, copyBatch)
+	for _, want := range [][]byte{msg('1'), msg('2'), copyIn} {
+		expectMsg(t, p.client, want)
+	}
+	mustWrite(t, p.client, data)
+	expectMsg(t, p.client, msg('C', cstr("COPY 1")))
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	// The queue is balanced: a following denial is reported at once, not stuck
+	// behind a phantom slot.
+	mustWrite(t, p.client, msg('Q', cstr("delete from x")))
+	if typ, body := readMsgT(t, p.client); typ != 'E' || errorFields(body)['C'] != "42501" {
+		t.Fatalf("denial after COPY: got %q %q, want ErrorResponse 42501", typ, body)
+	}
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+}
+
+func TestSimpleCopyInKeepsItsSlot(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+	frontend := p.frontend(allow)
+
+	// A simple-protocol COPY has one ReadyForQuery at the end, so its slot must
+	// survive the CopyInResponse.
+	q := msg('Q', cstr("copy t from stdin"))
+	copyIn := msg('G', []byte{0}, be16(1), be16(0))
+	data := bytes.Join([][]byte{msg('d', []byte("1\n")), msg('c')}, nil)
+
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, q); err != nil {
+			return err
+		}
+		if err := write(s, copyIn); err != nil {
+			return err
+		}
+		if err := expectBytes(s, data); err != nil {
+			return err
+		}
+
+		return write(s, msg('C', cstr("COPY 1")), msg('Z', []byte("I")))
+	})
+
+	mustWrite(t, p.client, q)
+	expectMsg(t, p.client, copyIn)
+	mustWrite(t, p.client, data)
+	expectMsg(t, p.client, msg('C', cstr("COPY 1")))
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+}
+
+func TestDenyAfterEarlyForwardTearsDownTheSession(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+	frontend := p.frontend(denyContaining("delete"))
+
+	// An explicit Flush forwards the first statement, then a denied Parse
+	// arrives. The proxy reports the denial and tears down, so the upstream
+	// rolls back instead of committing at a plain Sync.
+	first := bytes.Join([][]byte{pMsg("select 1"), bindMsg, execMsg, msg('H')}, nil)
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, first); err != nil {
+			return err
+		}
+
+		return write(s, msg('1'), msg('2'), msg('C', cstr("SELECT 1")))
+	})
+
+	mustWrite(t, p.client, first)
+	for _, want := range [][]byte{msg('1'), msg('2'), msg('C', cstr("SELECT 1"))} {
+		expectMsg(t, p.client, want)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	mustWrite(t, p.client, pMsg("delete from orders"))
+	if typ, body := readMsgT(t, p.client); typ != 'E' || errorFields(body)['C'] != "42501" {
+		t.Fatalf("denial: got %q %q, want ErrorResponse 42501", typ, body)
+	}
+
+	if err := <-frontend; err == nil {
+		t.Error("Frontend: got nil, want a teardown error after denying a partially forwarded batch")
+	}
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-backend
+}
+
 // pipes connects a session to a fake client and a fake upstream over net.Pipe.
 type pipes struct {
 	sess     wire.Session
