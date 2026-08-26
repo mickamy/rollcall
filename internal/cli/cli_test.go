@@ -3,8 +3,11 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mickamy/rollcall/internal/cli"
 	"github.com/mickamy/rollcall/internal/exit"
@@ -39,35 +42,45 @@ func TestRun(t *testing.T) {
 			wantCode: exit.Usage,
 			wantErr:  `unknown command "bogus"`,
 		},
-		"hello with default name": {
-			args:     []string{"hello"},
+		"proxy help": {
+			args:     []string{"proxy", "-h"},
 			wantCode: exit.OK,
-			wantOut:  "Hello, world!\n",
+			wantOut:  "Usage: " + cli.Name + " proxy",
 		},
-		"hello with name": {
-			args:     []string{"hello", "-name", "Go"},
+		"proxy help after flags": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-h"},
 			wantCode: exit.OK,
-			wantOut:  "Hello, Go!\n",
+			wantErr:  "Usage: " + cli.Name + " proxy",
 		},
-		"hello help": {
-			args:     []string{"hello", "-h"},
-			wantCode: exit.OK,
-			wantOut:  "Usage: " + cli.Name + " hello",
-		},
-		"hello with unknown flag": {
-			args:     []string{"hello", "-bogus"},
+		"proxy with unknown flag": {
+			args:     []string{"proxy", "-bogus"},
 			wantCode: exit.Usage,
 			wantErr:  "flag provided but not defined: -bogus",
 		},
-		"hello with unexpected argument": {
-			args:     []string{"hello", "extra"},
+		"proxy with unexpected argument": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "extra"},
 			wantCode: exit.Usage,
 			wantErr:  `unexpected argument "extra"`,
 		},
-		"hello with empty name": {
-			args:     []string{"hello", "-name", ""},
+		"proxy without upstream": {
+			args:     []string{"proxy"},
 			wantCode: exit.Error,
-			wantErr:  cli.Name + ": name must not be empty\n",
+			wantErr:  cli.Name + ": -upstream is required\n",
+		},
+		"proxy with upstream lacking a port": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1"},
+			wantCode: exit.Error,
+			wantErr:  cli.Name + ": -upstream: address 127.0.0.1: missing port in address\n",
+		},
+		"proxy with empty listen": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-listen", ""},
+			wantCode: exit.Error,
+			wantErr:  cli.Name + ": -listen is required\n",
+		},
+		"proxy with unlistenable address": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-listen", "127.0.0.1:port"},
+			wantCode: exit.Error,
+			wantErr:  cli.Name + ": listen tcp",
 		},
 	}
 
@@ -93,19 +106,67 @@ func TestRun(t *testing.T) {
 	}
 }
 
-func TestRunCanceled(t *testing.T) {
+func TestRunProxyStopsOnCancel(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errOut := newNotifyWriter("msg=listening")
+	code := make(chan int, 1)
+	go func() {
+		args := []string{"proxy", "-upstream", "127.0.0.1:0", "-listen", "127.0.0.1:0"}
+		code <- cli.Run(ctx, args, cli.IO{In: strings.NewReader(""), Out: io.Discard, Err: errOut})
+	}()
+
+	select {
+	case <-errOut.seen:
+	case c := <-code:
+		t.Fatalf("proxy exited with %d before listening (stderr: %q)", c, errOut.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not start listening")
+	}
+
 	cancel()
 
-	var out, errOut bytes.Buffer
-	code := cli.Run(ctx, []string{"hello"}, cli.IO{In: strings.NewReader(""), Out: &out, Err: &errOut})
+	select {
+	case c := <-code:
+		if c != exit.OK {
+			t.Errorf("exit code: got %d, want %d (stderr: %q)", c, exit.OK, errOut.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not stop after cancel")
+	}
+}
 
-	if code != exit.Error {
-		t.Errorf("exit code: got %d, want %d", code, exit.Error)
+// notifyWriter closes seen once the accumulated output contains want.
+type notifyWriter struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	want string
+	seen chan struct{}
+	once sync.Once
+}
+
+func newNotifyWriter(want string) *notifyWriter {
+	return &notifyWriter{want: want, seen: make(chan struct{})}
+}
+
+func (w *notifyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.want) {
+		w.once.Do(func() { close(w.seen) })
 	}
-	if !strings.Contains(errOut.String(), context.Canceled.Error()) {
-		t.Errorf("stderr: got %q, want it to mention %q", errOut.String(), context.Canceled)
-	}
+
+	return len(p), nil
+}
+
+func (w *notifyWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.buf.String()
 }

@@ -28,10 +28,10 @@ type command struct {
 
 var commands = []command{
 	{
-		name:    "hello",
-		summary: "Print a greeting",
-		run:     runHello,
-		usage:   printHelloUsage,
+		name:    "proxy",
+		summary: "Relay database connections to an upstream server",
+		run:     runProxy,
+		usage:   printProxyUsage,
 	},
 }
 
@@ -96,13 +96,11 @@ func lookup(name string) (command, bool) {
 }
 
 func wantsHelp(args []string) bool {
-	for _, a := range args {
-		if a == "-h" || a == "--help" || a == "help" {
-			return true
-		}
+	if len(args) == 0 {
+		return false
 	}
 
-	return false
+	return args[0] == "-h" || args[0] == "--help" || args[0] == "help"
 }
 
 func newFlagSet(name string, w io.Writer, usage func(io.Writer)) *flag.FlagSet {
