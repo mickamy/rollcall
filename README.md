@@ -19,6 +19,10 @@ brew install --cask mickamy/tap/rollcall
 
 Prebuilt binaries are on the [releases page](https://github.com/mickamy/rollcall/releases).
 
+## Status
+
+Early development. `rollcall proxy` currently relays PostgreSQL connections unchanged; policy enforcement and the access ledger are being built on top of it.
+
 ## Usage
 
 Start the proxy in front of a database and point your agent's connection at it:
