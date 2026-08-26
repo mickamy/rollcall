@@ -2,13 +2,29 @@ package sqlscan
 
 import "strings"
 
-// statements splits sql into top-level statements, each a slice of the
-// uppercased unquoted words it contains. Strings, comments, dollar-quoted
-// bodies, and quoted identifiers are skipped so their contents never look like
-// keywords; numbers and punctuation are dropped.
-func statements(sql string) [][]string {
-	var stmts [][]string
-	cur := make([]string, 0, 8)
+// tokKind marks the few token shapes classification needs. Strings, comments,
+// dollar-quoted bodies, numbers, and other punctuation are dropped entirely.
+type tokKind uint8
+
+const (
+	kindWord  tokKind = iota // an unquoted word, stored uppercased (a keyword candidate)
+	kindIdent                // a quoted identifier, stored lowercased (never a keyword)
+	kindOpen                 // (
+	kindClose                // )
+)
+
+type token struct {
+	kind tokKind
+	text string
+}
+
+// tokenize splits sql into top-level statements, each a slice of tokens. It
+// skips string literals, line and block comments, dollar-quoted bodies, and the
+// contents of quoted identifiers so that keywords hidden in them are never
+// mistaken for commands.
+func tokenize(sql string) [][]token {
+	var stmts [][]token
+	cur := make([]token, 0, 8)
 	i, n := 0, len(sql)
 
 	for i < n {
@@ -21,22 +37,30 @@ func statements(sql string) [][]string {
 		case c == '/' && i+1 < n && sql[i+1] == '*':
 			i = skipBlockComment(sql, i+2)
 		case c == '\'':
-			i = skipQuoted(sql, i+1, '\'')
+			i = skipString(sql, i+1)
 		case c == '"':
-			i = skipQuoted(sql, i+1, '"')
+			j := skipString(sql, i+1)
+			cur = append(cur, token{kind: kindIdent, text: quotedText(sql, i, j)})
+			i = j
 		case c == '$':
 			if end, ok := skipDollarQuote(sql, i); ok {
 				i = end
 			} else {
 				i = skipWord(sql, i+1) // parameter such as $1
 			}
+		case c == '(':
+			cur = append(cur, token{kind: kindOpen})
+			i++
+		case c == ')':
+			cur = append(cur, token{kind: kindClose})
+			i++
 		case c == ';':
 			stmts = append(stmts, cur)
-			cur = make([]string, 0, 8)
+			cur = make([]token, 0, 8)
 			i++
 		case isWordStart(c):
 			j := skipWord(sql, i+1)
-			cur = append(cur, strings.ToUpper(sql[i:j]))
+			cur = append(cur, token{kind: kindWord, text: strings.ToUpper(sql[i:j])})
 			i = j
 		default:
 			i++
@@ -47,8 +71,16 @@ func statements(sql string) [][]string {
 	return stmts
 }
 
+// quotedText returns the lowercased content of a quoted identifier spanning
+// s[start:end] (quotes included), so a quoted GUC name folds to compare.
+func quotedText(s string, start, end int) string {
+	inner := s[start+1 : end-1]
+
+	return strings.ToLower(strings.ReplaceAll(inner, `""`, `"`))
+}
+
 func skipLineComment(s string, i int) int {
-	for i < len(s) && s[i] != '\n' {
+	for i < len(s) && s[i] != '\n' && s[i] != '\r' {
 		i++
 	}
 
@@ -73,9 +105,11 @@ func skipBlockComment(s string, i int) int {
 	return i
 }
 
-// skipQuoted skips a string literal or quoted identifier that has already had
-// its opening quote consumed, honoring the doubled-quote escape.
-func skipQuoted(s string, i int, quote byte) int {
+// skipString skips a string literal or quoted identifier whose opening quote at
+// i-1 has been consumed, honoring the doubled-quote escape, and returns the
+// index just past the closing quote.
+func skipString(s string, i int) int {
+	quote := s[i-1]
 	for i < len(s) {
 		if s[i] == quote {
 			if i+1 < len(s) && s[i+1] == quote {
@@ -108,8 +142,7 @@ func skipDollarQuote(s string, i int) (int, bool) {
 	}
 
 	tag := s[i : j+1]
-	rest := s[j+1:]
-	if k := strings.Index(rest, tag); k >= 0 {
+	if k := strings.Index(s[j+1:], tag); k >= 0 {
 		return j + 1 + k + len(tag), true
 	}
 
@@ -137,8 +170,10 @@ func isWordStart(c byte) bool {
 	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
 }
 
+// isWordPart includes '$' so that identifiers such as x$a$ read as one word and
+// their inner '$' is not taken to start a dollar-quoted string.
 func isWordPart(c byte) bool {
-	return isWordStart(c) || isDigit(c)
+	return isWordStart(c) || isDigit(c) || c == '$'
 }
 
 func isTagPart(c byte) bool {
