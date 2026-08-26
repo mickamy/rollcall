@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mickamy/rollcall/internal/proxy"
+	"github.com/mickamy/rollcall/internal/wire"
 )
 
 const (
@@ -99,7 +101,7 @@ func TestServeReturnsAcceptError(t *testing.T) {
 	ln := listen(t)
 	errc := make(chan error, 1)
 	go func() {
-		errc <- proxy.Server{Upstream: unreachable}.Serve(t.Context(), ln)
+		errc <- proxy.Server{Upstream: unreachable, Dialect: rawDialect{}}.Serve(t.Context(), ln)
 	}()
 
 	_ = ln.Close()
@@ -114,6 +116,51 @@ func TestServeReturnsAcceptError(t *testing.T) {
 	}
 }
 
+func TestServeRequiresDialect(t *testing.T) {
+	t.Parallel()
+
+	ln := listen(t)
+	defer func() { _ = ln.Close() }()
+
+	err := proxy.Server{Upstream: unreachable}.Serve(t.Context(), ln)
+	if err == nil || !strings.Contains(err.Error(), "Dialect is required") {
+		t.Errorf("Serve: got %v, want a missing Dialect error", err)
+	}
+}
+
+// rawDialect relays bytes without interpreting them, so the proxy's lifecycle
+// can be tested against a plain echo server.
+type rawDialect struct{}
+
+func (rawDialect) NewSession(client, upstream net.Conn) wire.Session {
+	return rawSession{client: client, upstream: upstream}
+}
+
+type rawSession struct {
+	client   net.Conn
+	upstream net.Conn
+}
+
+func (rawSession) Handshake() (wire.Startup, error) {
+	return wire.Startup{User: "raw"}, nil
+}
+
+func (s rawSession) Frontend(wire.Handler) error {
+	if _, err := io.Copy(s.upstream, s.client); err != nil {
+		return fmt.Errorf("frontend: %w", err)
+	}
+
+	return nil
+}
+
+func (s rawSession) Backend() error {
+	if _, err := io.Copy(s.client, s.upstream); err != nil {
+		return fmt.Errorf("backend: %w", err)
+	}
+
+	return nil
+}
+
 func startProxy(t *testing.T, upstream string) (addr string, cancel context.CancelFunc, wait func() error) {
 	t.Helper()
 
@@ -123,7 +170,7 @@ func startProxy(t *testing.T, upstream string) (addr string, cancel context.Canc
 
 	errc := make(chan error, 1)
 	go func() {
-		errc <- proxy.Server{Upstream: upstream}.Serve(ctx, ln)
+		errc <- proxy.Server{Upstream: upstream, Dialect: rawDialect{}}.Serve(ctx, ln)
 	}()
 
 	wait = func() error {
