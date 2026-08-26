@@ -45,6 +45,23 @@ func (f HandlerFunc) Statement(stmt Statement) Verdict {
 	return f(stmt)
 }
 
+// Guard resolves the Handler for a session from the client's identity. Resolve
+// runs once, after the handshake.
+type Guard interface {
+	Resolve(startup Startup) Handler
+}
+
+type GuardFunc func(startup Startup) Handler
+
+func (f GuardFunc) Resolve(startup Startup) Handler {
+	return f(startup)
+}
+
+// AllowAll is a Guard whose sessions permit every statement.
+var AllowAll Guard = GuardFunc(func(Startup) Handler {
+	return HandlerFunc(func(Statement) Verdict { return Verdict{} })
+})
+
 type Dialect interface {
 	NewSession(client, upstream net.Conn) Session
 }
