@@ -3,7 +3,10 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
+	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -106,6 +109,28 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestIsLoopback(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]bool{
+		"127.0.0.1:6432":   true,
+		"[::1]:6432":       true,
+		"localhost:6432":   true,
+		"0.0.0.0:6432":     false,
+		"[::]:6432":        false,
+		":6432":            false,
+		"10.0.0.5:6432":    false,
+		"db.internal:6432": false,
+		"garbage":          false,
+	}
+
+	for addr, want := range tests {
+		if got := cli.IsLoopback(addr); got != want {
+			t.Errorf("isLoopback(%q): got %v, want %v", addr, got, want)
+		}
+	}
+}
+
 func TestRunProxyStopsOnCancel(t *testing.T) {
 	t.Parallel()
 
@@ -136,6 +161,185 @@ func TestRunProxyStopsOnCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("proxy did not stop after cancel")
+	}
+}
+
+func TestRunProxyServesPostgreSQL(t *testing.T) {
+	t.Parallel()
+
+	upstream := startFakePostgres(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errOut := newNotifyWriter("msg=listening")
+	code := make(chan int, 1)
+	go func() {
+		args := []string{"proxy", "-upstream", upstream, "-listen", "127.0.0.1:0"}
+		code <- cli.Run(ctx, args, cli.IO{In: strings.NewReader(""), Out: io.Discard, Err: errOut})
+	}()
+
+	select {
+	case <-errOut.seen:
+	case c := <-code:
+		t.Fatalf("proxy exited with %d before listening (stderr: %q)", c, errOut.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not start listening")
+	}
+
+	addr := regexp.MustCompile(`addr=(\S+)`).FindStringSubmatch(errOut.String())
+	if addr == nil {
+		t.Fatalf("stderr: got %q, want the listening address", errOut.String())
+	}
+
+	var dialer net.Dialer
+	client, err := dialer.DialContext(ctx, "tcp", addr[1])
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+
+	writeAll(t, client, startupPacket("user", "alice", "database", "app"))
+	expectMessage(t, client, pgMessage('R', be32(0)))
+	expectMessage(t, client, pgMessage('Z', []byte("I")))
+
+	writeAll(t, client, pgMessage('Q', cstring("select 1")))
+	expectMessage(t, client, pgMessage('C', cstring("SELECT 1")))
+	expectMessage(t, client, pgMessage('Z', []byte("I")))
+
+	writeAll(t, client, pgMessage('X'))
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Error("connection still open after Terminate")
+	}
+
+	cancel()
+
+	select {
+	case c := <-code:
+		if c != exit.OK {
+			t.Errorf("exit code: got %d, want %d (stderr: %q)", c, exit.OK, errOut.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not stop after cancel")
+	}
+
+	for _, want := range []string{"msg=\"session opened\"", "user=alice", "database=app", "msg=\"session closed\""} {
+		if !strings.Contains(errOut.String(), want) {
+			t.Errorf("stderr: got %q, want it to contain %q", errOut.String(), want)
+		}
+	}
+}
+
+// startFakePostgres serves trust authentication and answers every simple
+// query with "SELECT 1" until the client terminates.
+func startFakePostgres(t *testing.T) string {
+	t.Helper()
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			go serveFakePostgres(conn)
+		}
+	}()
+
+	return ln.Addr().String()
+}
+
+func serveFakePostgres(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+
+	length := make([]byte, 4)
+	if _, err := io.ReadFull(conn, length); err != nil {
+		return
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(binary.BigEndian.Uint32(length))-4); err != nil {
+		return
+	}
+	if _, err := conn.Write(bytes.Join([][]byte{pgMessage('R', be32(0)), pgMessage('Z', []byte("I"))}, nil)); err != nil {
+		return
+	}
+
+	for {
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return
+		}
+		if _, err := io.CopyN(io.Discard, conn, int64(binary.BigEndian.Uint32(header[1:]))-4); err != nil {
+			return
+		}
+
+		switch header[0] {
+		case 'Q':
+			reply := bytes.Join([][]byte{pgMessage('C', cstring("SELECT 1")), pgMessage('Z', []byte("I"))}, nil)
+			if _, err := conn.Write(reply); err != nil {
+				return
+			}
+		case 'X':
+			return
+		}
+	}
+}
+
+func be32(v uint32) []byte {
+	return binary.BigEndian.AppendUint32(nil, v)
+}
+
+func cstring(s string) []byte {
+	return append([]byte(s), 0)
+}
+
+func pgMessage(typ byte, parts ...[]byte) []byte {
+	body := bytes.Join(parts, nil)
+	out := []byte{typ}
+	out = binary.BigEndian.AppendUint32(out, uint32(len(body)+4)) //nolint:gosec // test payloads are tiny
+
+	return append(out, body...)
+}
+
+func startupPacket(params ...string) []byte {
+	var body []byte
+	body = binary.BigEndian.AppendUint32(body, 196608)
+	for _, p := range params {
+		body = append(body, cstring(p)...)
+	}
+	body = append(body, 0)
+
+	out := binary.BigEndian.AppendUint32(nil, uint32(len(body)+4)) //nolint:gosec // test payloads are tiny
+
+	return append(out, body...)
+}
+
+func writeAll(t *testing.T, w io.Writer, b []byte) {
+	t.Helper()
+
+	if _, err := w.Write(b); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func expectMessage(t *testing.T, r io.Reader, want []byte) {
+	t.Helper()
+
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(r, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("message: got %q, want %q", got, want)
 	}
 }
 
