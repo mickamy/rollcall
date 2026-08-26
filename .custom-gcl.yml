@@ -1,0 +1,9 @@
+version: v2.13.1
+destination: bin
+plugins:
+  - module: github.com/go-by-value/deadmut
+    import: github.com/go-by-value/deadmut/plugin
+    version: v0.1.1
+  - module: github.com/go-by-value/pointless
+    import: github.com/go-by-value/pointless/plugin
+    version: v0.1.1

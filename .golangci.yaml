@@ -1,0 +1,95 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - localmodule
+
+linters:
+  default: all
+  enable:
+    - deadmut
+    - pointless
+  settings:
+    custom:
+      deadmut:
+        type: module
+        description: Reports mutations of range loop value copies that have no effect.
+        original-url: github.com/go-by-value/deadmut
+      pointless:
+        type: module
+        description: Reports pointers to small structs that could be values.
+        original-url: github.com/go-by-value/pointless
+        settings:
+          threshold: 256    # Copying up to 256 bytes costs about one non-inlined call
+          receivers: method # Report each method that can take a value receiver, even if a sibling method needs the pointer
+          returns: true     # Report functions whose every return is a fresh &T{} or new(T); the default, kept explicit
+          slices: true      # Off upstream as a style choice; the check is conservative, so opt in
+    errcheck:
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+          yaml: snake
+    usetesting:
+      context-background: true
+      context-todo: true
+      os-mkdir-temp: true
+      os-setenv: true
+      os-chdir: true
+  disable:
+    - cyclop           # Redundant; cognitive complexity is already tracked by gocognit
+    - depguard         # Import restrictions are not currently required
+    - dogsled          # Multiple blank identifiers are unavoidable with some stdlib functions (e.g., runtime.Caller)
+    - dupl             # High false-positive rate in test suites where setup code is similar
+    - err113           # Sentinel errors are used where meaningful; contextual fmt.Errorf is preferred elsewhere
+    - exhaustruct      # Hinders use of default values; too boilerplate-heavy for large structs
+    - exhaustruct_v5   # Same as exhaustruct
+    - forbidigo        # CLI tools rely on fmt.Fprint for user output
+    - funlen           # Table-driven tests naturally exceed standard length
+    - gochecknoglobals # Package-level tables (e.g., the command list) are the simplest design for a CLI
+    - gochecknoinits   # Required for specific library registrations and setup hooks
+    - gocognit         # Thresholds are often too low for complex but necessary logic
+    - goconst          # Repeated strings in tests are clearer than abstract constants
+    - godot            # Punctuation in comments is a stylistic choice, not a code quality issue
+    - gomoddirectives  # Local replace directives are needed for example modules
+    - gomodguard       # Deprecated; use gomodguard_v2 instead
+    - ireturn          # Returning interfaces is a valid design pattern
+    - mnd              # "Magic numbers" are often self-explanatory (e.g., exit codes, time units)
+    - nestif           # Deep nesting is sometimes the most readable way to handle complex logic
+    - nlreturn         # Forcing newlines before returns is purely stylistic and often disruptive
+    - noinlineerr      # Inline error handling (if err := ...; err != nil) is idiomatic Go
+    - nonamedreturns   # Named returns improve documentation and clarity for complex signatures
+    - recvcheck        # Value receivers are preferred when the receiver is not mutated
+    - revive           # Most rules are already covered by more specialized linters
+    - thelper          # Its main check conflicts with table-driven test closures; remaining checks are trivial
+    - varnamelen       # Short, idiomatic names (i, k, v) are preferred in concise Go code
+    - wsl              # Excessive whitespace enforcement degrades code density and readability
+    - wsl_v5           # Same as wsl
+  exclusions:
+    warn-unused: true
+    presets:
+      - std-error-handling
+      - common-false-positives
+    paths:
+      - tmp # scratch space for spikes and one-off scripts; not part of the build
+    rules:
+      - path: _test\.go
+        linters:
+          - gocyclo    # Each table case adds branches; cyclomatic complexity is not a quality signal in tests
+          - maintidx   # Table-driven tests grow long by design; the maintainability index is not useful there
+          - unparam    # Test helpers often take parameters with a single value today; keeping the signature is clearer
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
