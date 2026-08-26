@@ -3,8 +3,11 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mickamy/rollcall/internal/cli"
 	"github.com/mickamy/rollcall/internal/exit"
@@ -44,6 +47,11 @@ func TestRun(t *testing.T) {
 			wantCode: exit.OK,
 			wantOut:  "Usage: " + cli.Name + " proxy",
 		},
+		"proxy help after flags": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-h"},
+			wantCode: exit.OK,
+			wantErr:  "Usage: " + cli.Name + " proxy",
+		},
 		"proxy with unknown flag": {
 			args:     []string{"proxy", "-bogus"},
 			wantCode: exit.Usage,
@@ -58,6 +66,16 @@ func TestRun(t *testing.T) {
 			args:     []string{"proxy"},
 			wantCode: exit.Error,
 			wantErr:  cli.Name + ": -upstream is required\n",
+		},
+		"proxy with upstream lacking a port": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1"},
+			wantCode: exit.Error,
+			wantErr:  cli.Name + ": -upstream: address 127.0.0.1: missing port in address\n",
+		},
+		"proxy with empty listen": {
+			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-listen", ""},
+			wantCode: exit.Error,
+			wantErr:  cli.Name + ": -listen is required\n",
 		},
 		"proxy with unlistenable address": {
 			args:     []string{"proxy", "-upstream", "127.0.0.1:5432", "-listen", "127.0.0.1:port"},
@@ -88,20 +106,67 @@ func TestRun(t *testing.T) {
 	}
 }
 
-func TestRunProxyStopsWhenCanceled(t *testing.T) {
+func TestRunProxyStopsOnCancel(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errOut := newNotifyWriter("msg=listening")
+	code := make(chan int, 1)
+	go func() {
+		args := []string{"proxy", "-upstream", "127.0.0.1:0", "-listen", "127.0.0.1:0"}
+		code <- cli.Run(ctx, args, cli.IO{In: strings.NewReader(""), Out: io.Discard, Err: errOut})
+	}()
+
+	select {
+	case <-errOut.seen:
+	case c := <-code:
+		t.Fatalf("proxy exited with %d before listening (stderr: %q)", c, errOut.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not start listening")
+	}
+
 	cancel()
 
-	var out, errOut bytes.Buffer
-	args := []string{"proxy", "-upstream", "127.0.0.1:5432", "-listen", "127.0.0.1:0"}
-	code := cli.Run(ctx, args, cli.IO{In: strings.NewReader(""), Out: &out, Err: &errOut})
+	select {
+	case c := <-code:
+		if c != exit.OK {
+			t.Errorf("exit code: got %d, want %d (stderr: %q)", c, exit.OK, errOut.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not stop after cancel")
+	}
+}
 
-	if code != exit.OK {
-		t.Errorf("exit code: got %d, want %d (stderr: %q)", code, exit.OK, errOut.String())
+// notifyWriter closes seen once the accumulated output contains want.
+type notifyWriter struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	want string
+	seen chan struct{}
+	once sync.Once
+}
+
+func newNotifyWriter(want string) *notifyWriter {
+	return &notifyWriter{want: want, seen: make(chan struct{})}
+}
+
+func (w *notifyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.want) {
+		w.once.Do(func() { close(w.seen) })
 	}
-	if !strings.Contains(errOut.String(), "msg=listening") {
-		t.Errorf("stderr: got %q, want it to log that it listened", errOut.String())
-	}
+
+	return len(p), nil
+}
+
+func (w *notifyWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.buf.String()
 }
