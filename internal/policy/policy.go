@@ -95,28 +95,37 @@ func parseFail(s string) (bool, error) {
 func (p Policy) Resolve(startup wire.Startup) wire.Enforcement {
 	role, ok := p.Roles[startup.User]
 	if !ok {
-		return p.unlisted(startup.User)
+		return p.unlisted(startup)
 	}
 
+	principal := wire.Principal{
+		Agent:       role.Agent,
+		Purpose:     role.Purpose,
+		User:        startup.User,
+		Database:    startup.Database,
+		Application: startup.Application,
+	}
 	if !role.ReadOnly {
-		return wire.Enforcement{Handler: allow()}
+		return wire.Enforcement{Principal: principal, Handler: allow()}
 	}
 
 	return wire.Enforcement{
-		Prime:   []string{readOnlyPrime},
-		Handler: wire.HandlerFunc(readOnly),
+		Principal: principal,
+		Prime:     []string{readOnlyPrime},
+		Handler:   wire.HandlerFunc(readOnly),
 	}
 }
 
-func (p Policy) unlisted(user string) wire.Enforcement {
+func (p Policy) unlisted(startup wire.Startup) wire.Enforcement {
+	principal := wire.Principal{User: startup.User, Database: startup.Database, Application: startup.Application}
 	if !p.FailClosed {
-		return wire.Enforcement{Handler: allow()}
+		return wire.Enforcement{Principal: principal, Handler: allow()}
 	}
 
-	return wire.Enforcement{Handler: wire.HandlerFunc(func(wire.Statement) wire.Verdict {
+	return wire.Enforcement{Principal: principal, Handler: wire.HandlerFunc(func(wire.Statement) wire.Verdict {
 		return wire.Verdict{
 			Deny:    true,
-			Message: fmt.Sprintf("no policy for role %q", user),
+			Message: fmt.Sprintf("no policy for role %q", startup.User),
 			Hint:    "add the role to the policy, or connect as a configured role",
 		}
 	})}
