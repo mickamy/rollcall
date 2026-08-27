@@ -162,3 +162,22 @@ func disables(sql string) bool {
 
 	return false
 }
+
+func TestFingerprint(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"select * from t where id = 42":            "SELECT * FROM T WHERE ID = ?",
+		"select id from t where email = 'a@b.com'": "SELECT ID FROM T WHERE EMAIL = ?",
+		"insert into t values (1, 'x'), (2, 'y')":  "INSERT INTO T VALUES (?, ?), (?, ?)",
+		"select   col   from t -- note\n":          "SELECT COL FROM T",
+		`select "MixedCase" from t where x = $1`:   `SELECT "mixedcase" FROM T WHERE X = ?`,
+		"select $$body$$ as b":                     "SELECT ? AS B",
+		"select 3.14, 1e9 from t":                  "SELECT ?, ? FROM T",
+	}
+	for sql, want := range tests {
+		if got := sqlscan.Fingerprint(sql); got != want {
+			t.Errorf("Fingerprint(%q) = %q, want %q", sql, got, want)
+		}
+	}
+}
