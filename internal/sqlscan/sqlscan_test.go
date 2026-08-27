@@ -1,6 +1,7 @@
 package sqlscan_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/mickamy/rollcall/internal/sqlscan"
@@ -179,5 +180,20 @@ func TestFingerprint(t *testing.T) {
 		if got := sqlscan.Fingerprint(sql); got != want {
 			t.Errorf("Fingerprint(%q) = %q, want %q", sql, got, want)
 		}
+	}
+}
+
+func TestEscapeStringsDoNotLeak(t *testing.T) {
+	t.Parallel()
+
+	// In an E'' string a backslash escapes the quote, so the words inside must
+	// not surface as identifiers in the fingerprint or flip classification.
+	sql := `select id from t where name = E'O\'Brien said delete from t'`
+	fp := sqlscan.Fingerprint(sql)
+	if strings.Contains(fp, "BRIEN") || strings.Contains(fp, "DELETE") {
+		t.Errorf("Fingerprint leaked E-string content: %q", fp)
+	}
+	if sqlscan.Mutating(sql) {
+		t.Errorf("Mutating(%q) = true; the DELETE is inside an E-string", sql)
 	}
 }
