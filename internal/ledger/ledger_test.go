@@ -25,7 +25,8 @@ func TestGuardRecordsStatements(t *testing.T) {
 			Handler: wire.HandlerFunc(func(wire.Statement) wire.Verdict { return wire.Verdict{} }),
 		}
 	})
-	g := ledger.Guard{Inner: inner, Sink: ledger.NewSink(&buf)}
+	sink := ledger.NewSink(&buf, ledger.Options{})
+	g := ledger.Guard{Inner: inner, Sink: sink}
 
 	enf := g.Resolve(wire.Startup{User: "agent_ops", Database: "prod"})
 
@@ -38,6 +39,7 @@ func TestGuardRecordsStatements(t *testing.T) {
 	// A denied UPDATE.
 	enf.Recorder.Begin("update orders set x = 1", wire.Denied).Done()
 
+	sink.Close()
 	recs := decode(t, &buf)
 	if len(recs) != 2 {
 		t.Fatalf("records: got %d, want 2", len(recs))
@@ -66,12 +68,11 @@ func TestSinkChainsHashes(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	s := ledger.NewSink(&buf)
+	s := ledger.NewSink(&buf, ledger.Options{})
 	for range 3 {
-		if err := s.Write(ledger.Record{User: "u", Kind: "SELECT"}); err != nil {
-			t.Fatalf("Write: %v", err)
-		}
+		s.Write(ledger.Record{User: "u", Kind: "SELECT"})
 	}
+	s.Close()
 
 	recs := decode(t, &buf)
 	if recs[0].PrevHash != "" {
@@ -101,4 +102,30 @@ func decode(t *testing.T, buf *bytes.Buffer) []ledger.Record {
 	}
 
 	return out
+}
+
+func TestSinkResumesChainWithPrevAndKey(t *testing.T) {
+	t.Parallel()
+
+	var first bytes.Buffer
+	s1 := ledger.NewSink(&first, ledger.Options{Key: []byte("secret")})
+	s1.Write(ledger.Record{User: "u", Kind: "SELECT"})
+	s1.Write(ledger.Record{User: "u", Kind: "SELECT"})
+	s1.Close()
+	firstRecs := decode(t, &first)
+	last := firstRecs[len(firstRecs)-1].Hash
+
+	// A new sink seeded with the last hash continues the same chain.
+	var second bytes.Buffer
+	s2 := ledger.NewSink(&second, ledger.Options{Prev: last, Key: []byte("secret")})
+	s2.Write(ledger.Record{User: "u", Kind: "DELETE"})
+	s2.Close()
+	next := decode(t, &second)
+
+	if next[0].PrevHash != last {
+		t.Errorf("resumed PrevHash: got %q, want %q", next[0].PrevHash, last)
+	}
+	if next[0].Hash == "" {
+		t.Error("resumed record has no hash")
+	}
 }

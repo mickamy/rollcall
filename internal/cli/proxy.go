@@ -64,12 +64,20 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 	logger := slog.New(slog.NewTextHandler(std.Err, nil))
 
 	if *ledgerPath != "" {
+		prev, err := ledger.LastHash(*ledgerPath)
+		if err != nil {
+			return fail(std, err)
+		}
+
 		f, err := os.OpenFile(*ledgerPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return fail(std, fmt.Errorf("open ledger: %w", err))
 		}
 		defer func() { _ = f.Close() }()
-		guard = ledger.Guard{Inner: guard, Sink: ledger.NewSink(f), Logger: logger}
+
+		sink := ledger.NewSink(f, ledger.Options{Prev: prev, Key: ledgerKey(), Logger: logger})
+		defer sink.Close()
+		guard = ledger.Guard{Inner: guard, Sink: sink}
 	}
 
 	var lc net.ListenConfig
@@ -90,6 +98,16 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 	}
 
 	return exit.OK
+}
+
+// ledgerKey returns the optional key that makes the ledger chain an HMAC,
+// from ROLLCALL_LEDGER_KEY. Without it the chain is a plain SHA-256.
+func ledgerKey() []byte {
+	if v := os.Getenv("ROLLCALL_LEDGER_KEY"); v != "" {
+		return []byte(v)
+	}
+
+	return nil
 }
 
 func validateAddr(flagName, addr string) error {
