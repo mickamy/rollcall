@@ -708,6 +708,136 @@ func TestDenyAfterEarlyForwardTearsDownTheSession(t *testing.T) {
 	<-backend
 }
 
+type capture struct {
+	sql      string
+	decision wire.Decision
+	rows     int
+	done     bool
+}
+
+type capturingRecorder struct{ records *[]*capture }
+
+func (r capturingRecorder) Begin(sql string, d wire.Decision) wire.Result {
+	c := &capture{sql: sql, decision: d}
+	*r.records = append(*r.records, c)
+
+	return c
+}
+
+func (capture) Columns([]string) []int { return nil }
+func (capture) Row([][]byte)           {}
+func (c *capture) Complete(tag string) { c.rows += tagRows(tag) }
+func (c *capture) Done()               { c.done = true }
+
+func tagRows(tag string) int {
+	fields := splitSpace(tag)
+	if len(fields) == 0 {
+		return 0
+	}
+
+	n := 0
+	for _, c := range fields[len(fields)-1] {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+
+	return n
+}
+
+func splitSpace(s string) []string {
+	var out []string
+	cur := ""
+	for _, c := range s {
+		if c == ' ' {
+			if cur != "" {
+				out = append(out, cur)
+				cur = ""
+			}
+
+			continue
+		}
+		cur += string(c)
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+
+	return out
+}
+
+func TestFrontendRecordsSimpleQueryOutcome(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	query := msg('Q', cstr("select id from t"))
+	reply := [][]byte{
+		msg('T', be16(1), cstr("id"), be32(0), be16(0), be32(23), be16(4), be32(0xffffffff), be16(0)),
+		msg('D', be16(1), be32(1), []byte("7")),
+		msg('D', be16(1), be32(1), []byte("8")),
+		msg('C', cstr("SELECT 2")),
+		msg('Z', []byte("I")),
+	}
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, query); err != nil {
+			return err
+		}
+
+		return write(s, reply...)
+	})
+
+	mustWrite(t, p.client, query)
+	for _, want := range reply {
+		expectMsg(t, p.client, want)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d, want 1", len(records))
+	}
+	rec := records[0]
+	if rec.sql != "select id from t" || rec.decision != wire.Allowed || rec.rows != 2 || !rec.done {
+		t.Errorf("record: got %+v, want allowed select with 2 rows, done", rec)
+	}
+}
+
+func TestFrontendRecordsDenial(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	var records []*capture
+	done := p.frontendRec(denyContaining("delete"), capturingRecorder{records: &records})
+
+	mustWrite(t, p.client, msg('Q', cstr("delete from t")))
+	if typ, _ := readMsgT(t, p.client); typ != 'E' {
+		t.Fatal("expected ErrorResponse")
+	}
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+
+	mustWrite(t, p.client, msg('X'))
+	expectMsg(t, p.upstream, msg('X'))
+	<-done
+
+	if len(records) != 1 || records[0].decision != wire.Denied || !records[0].done {
+		t.Errorf("records: got %+v, want one denied+done record", records)
+	}
+}
+
 // pipes connects a session to a fake client and a fake upstream over net.Pipe.
 type pipes struct {
 	sess     wire.Session
@@ -746,8 +876,12 @@ func (p pipes) handshake() <-chan handshakeResult {
 }
 
 func (p pipes) frontend(h wire.Handler) <-chan error {
+	return p.frontendRec(h, nil)
+}
+
+func (p pipes) frontendRec(h wire.Handler, rec wire.Recorder) <-chan error {
 	done := make(chan error, 1)
-	go func() { done <- p.sess.Frontend(h) }()
+	go func() { done <- p.sess.Frontend(h, rec) }()
 
 	return done
 }

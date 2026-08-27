@@ -72,6 +72,7 @@ func (d Dialect) NewSession(client, upstream net.Conn) wire.Session {
 type slot struct {
 	forwarded bool
 	simple    bool
+	result    wire.Result
 	code      string
 	message   string
 	hint      string
@@ -84,13 +85,16 @@ type session struct {
 	// Frontend goroutine only.
 	cr        *bufio.Reader
 	uw        *bufio.Writer
+	recorder  wire.Recorder
 	pending   bytes.Buffer
 	forwarded bool // part of the current batch was already sent upstream
 	denied    bool // a statement in the current batch was denied
 
 	// Backend goroutine only.
-	ur    *bufio.Reader
-	small []byte
+	ur        *bufio.Reader
+	small     []byte
+	curResult wire.Result // the result currently streaming from the upstream
+	curCap    []int       // columns the recorder asked to capture for it
 
 	// mu serializes writes to the client, which Frontend (denials) and Backend
 	// (forwarded messages) both perform, and guards tx and queue alongside them.
@@ -169,7 +173,8 @@ func (s *session) Prime(sql string) error {
 // Frontend relays client messages, consulting h for every statement. Extended
 // messages are held until their Sync so a batch can be accepted or rejected as
 // a unit. Output is flushed whenever the client has nothing more buffered.
-func (s *session) Frontend(h wire.Handler) error {
+func (s *session) Frontend(h wire.Handler, rec wire.Recorder) error {
+	s.recorder = rec
 	for {
 		if s.cr.Buffered() == 0 {
 			if err := flush(s.uw); err != nil {
@@ -224,6 +229,12 @@ func (s *session) Backend() error {
 			if err = s.forwardToClient(typ, n); err == nil {
 				s.copyInStarted()
 			}
+		case typeRowDescription:
+			err = s.describeResult(n)
+		case typeDataRow:
+			err = s.rowResult(n)
+		case typeCommandComplete:
+			err = s.completeResult(n)
 		default:
 			err = s.forwardToClient(typ, n)
 		}
@@ -329,13 +340,15 @@ func (s *session) query(h wire.Handler, n uint32) error {
 
 	sql := string(bytes.TrimSuffix(body, []byte{0}))
 	if v := h.Statement(wire.Statement{SQL: sql}); v.Deny {
+		s.record(sql, wire.Denied)
+
 		return s.respond(readySlot(denial(v)))
 	}
 
 	// Enqueue before the statement can reach the upstream, so Backend never sees
 	// the reply before the slot that accounts for it. A simple query's
 	// ReadyForQuery survives COPY, so mark it.
-	s.enqueue(slot{forwarded: true, simple: true})
+	s.enqueue(slot{forwarded: true, simple: true, result: s.begin(sql, wire.Allowed)})
 
 	return writeMessage(s.uw, typeQuery, body)
 }
@@ -366,8 +379,11 @@ func (s *session) parse(h wire.Handler, n uint32) error {
 	}
 
 	if v := h.Statement(wire.Statement{SQL: sql}); v.Deny {
+		s.record(sql, wire.Denied)
+
 		return s.denyBatch(denial(v))
 	}
+	s.record(sql, wire.Allowed)
 
 	return s.stage(typeParse, body)
 }
@@ -605,6 +621,11 @@ func (s *session) readyForQuery(n uint32) error {
 		return fmt.Errorf("%w: ReadyForQuery without a pending request", errMalformed)
 	}
 
+	if r := s.queue[0].result; r != nil {
+		r.Done()
+	}
+	s.curResult = nil
+	s.curCap = nil
 	s.queue = s.queue[1:]
 	s.tx = status[0]
 	if err := writeMessage(s.cw, typeReadyForQuery, status[:]); err != nil {
@@ -653,6 +674,99 @@ func (s *session) forwardToClient(typ byte, n uint32) error {
 	defer s.mu.Unlock()
 
 	return writeMessage(s.cw, typ, body)
+}
+
+// begin starts a ledger record for an allowed statement, returning the result
+// to attach to its slot, or nil when nothing records.
+func (s *session) begin(sql string, decision wire.Decision) wire.Result {
+	if s.recorder == nil {
+		return nil
+	}
+
+	return s.recorder.Begin(sql, decision)
+}
+
+// record writes a ledger record for a statement with no result to observe, such
+// as a denial or an extended-protocol Parse.
+func (s *session) record(sql string, decision wire.Decision) {
+	if r := s.begin(sql, decision); r != nil {
+		r.Done()
+	}
+}
+
+// describeResult forwards a RowDescription and tells the current result which
+// columns to capture.
+func (s *session) describeResult(n uint32) error {
+	body, err := readBody(s.ur, n)
+	if err != nil {
+		return err
+	}
+
+	res, err := s.forwardResult(typeRowDescription, body)
+	if err != nil {
+		return err
+	}
+	s.curResult = res
+	s.curCap = nil
+	if res != nil {
+		s.curCap = res.Columns(columnNames(body))
+	}
+
+	return nil
+}
+
+// rowResult forwards a DataRow, capturing the requested columns when the result
+// is being recorded.
+func (s *session) rowResult(n uint32) error {
+	if s.curResult == nil || len(s.curCap) == 0 {
+		return s.forwardToClient(typeDataRow, n) // stream without materializing
+	}
+
+	body, err := readBody(s.ur, n)
+	if err != nil {
+		return err
+	}
+	if _, err := s.forwardResult(typeDataRow, body); err != nil {
+		return err
+	}
+	s.curResult.Row(rowValues(body, s.curCap))
+
+	return nil
+}
+
+// completeResult forwards a CommandComplete and adds its row count to the result.
+func (s *session) completeResult(n uint32) error {
+	body, err := readBody(s.ur, n)
+	if err != nil {
+		return err
+	}
+
+	res, err := s.forwardResult(typeCommandComplete, body)
+	if err != nil {
+		return err
+	}
+	if res != nil {
+		res.Complete(commandTag(body))
+	}
+
+	return nil
+}
+
+// forwardResult writes one already-read message to the client and returns the
+// result attached to the request currently being answered, if any.
+func (s *session) forwardResult(typ byte, body []byte) (wire.Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var res wire.Result
+	if len(s.queue) > 0 && s.queue[0].forwarded {
+		res = s.queue[0].result
+	}
+	if err := writeMessage(s.cw, typ, body); err != nil {
+		return nil, err
+	}
+
+	return res, nil
 }
 
 func (s *session) flushClient() error {

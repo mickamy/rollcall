@@ -130,7 +130,7 @@ func (s Server) handle(ctx context.Context, client net.Conn) {
 	var wg sync.WaitGroup
 	var toUpstream, toClient error
 	wg.Go(func() {
-		toUpstream = sess.Frontend(enforcement.Handler)
+		toUpstream = sess.Frontend(enforcement.Handler, enforcement.Recorder)
 		closeWrite(upstream)
 	})
 	wg.Go(func() {
