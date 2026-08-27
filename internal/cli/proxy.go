@@ -11,19 +11,23 @@ import (
 
 	"github.com/mickamy/rollcall/internal/exit"
 	"github.com/mickamy/rollcall/internal/pg"
+	"github.com/mickamy/rollcall/internal/policy"
 	"github.com/mickamy/rollcall/internal/proxy"
+	"github.com/mickamy/rollcall/internal/wire"
 )
 
 const (
 	defaultListen = "127.0.0.1:6432"
 	listenUsage   = "address to accept client connections on"
 	upstreamUsage = "address of the upstream database"
+	policyUsage   = "path to a policy file; without one every statement is allowed"
 )
 
 func runProxy(ctx context.Context, args []string, std IO) int {
 	fs := newFlagSet("proxy", std.Err, printProxyUsage)
 	listen := fs.String("listen", defaultListen, listenUsage)
 	upstream := fs.String("upstream", "", upstreamUsage)
+	policyPath := fs.String("policy", "", policyUsage)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exit.OK
@@ -44,6 +48,15 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 		return fail(std, err)
 	}
 
+	guard := wire.AllowAll
+	if *policyPath != "" {
+		p, err := policy.Load(*policyPath)
+		if err != nil {
+			return fail(std, err)
+		}
+		guard = p
+	}
+
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", *listen)
 	if err != nil {
@@ -57,7 +70,7 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 		logger.Warn("listening outside loopback: clients and the upstream are served in plaintext", "addr", *listen)
 	}
 
-	srv := proxy.Server{Upstream: *upstream, Dialect: pg.Dialect{}, Logger: logger}
+	srv := proxy.Server{Upstream: *upstream, Dialect: pg.Dialect{}, Guard: guard, Logger: logger}
 	if err := srv.Serve(ctx, ln); err != nil {
 		return fail(std, err)
 	}
@@ -104,4 +117,5 @@ func printProxyUsage(w io.Writer) {
 	fmt.Fprint(w, "Flags:\n")
 	fmt.Fprintf(w, "  -upstream ADDR  %s (required)\n", upstreamUsage)
 	fmt.Fprintf(w, "  -listen ADDR    %s (default %q)\n", listenUsage, defaultListen)
+	fmt.Fprintf(w, "  -policy PATH    %s\n", policyUsage)
 }

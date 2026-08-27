@@ -45,6 +45,30 @@ func (f HandlerFunc) Statement(stmt Statement) Verdict {
 	return f(stmt)
 }
 
+// Enforcement is how a session is guarded: statements to run on the upstream
+// before the relay starts, and the handler that judges each client statement.
+type Enforcement struct {
+	Prime   []string
+	Handler Handler
+}
+
+// Guard resolves the enforcement for a session from the client's identity.
+// Resolve runs once, after the handshake.
+type Guard interface {
+	Resolve(startup Startup) Enforcement
+}
+
+type GuardFunc func(startup Startup) Enforcement
+
+func (f GuardFunc) Resolve(startup Startup) Enforcement {
+	return f(startup)
+}
+
+// AllowAll is a Guard whose sessions permit every statement.
+var AllowAll Guard = GuardFunc(func(Startup) Enforcement {
+	return Enforcement{Handler: HandlerFunc(func(Statement) Verdict { return Verdict{} })}
+})
+
 type Dialect interface {
 	NewSession(client, upstream net.Conn) Session
 }
@@ -54,6 +78,10 @@ type Dialect interface {
 // until their side of the conversation ends.
 type Session interface {
 	Handshake() (Startup, error)
+	// Prime runs one statement on the upstream and consumes its result before
+	// the relay starts, for session setup such as enabling read-only mode. It
+	// runs after Handshake and before Frontend and Backend.
+	Prime(sql string) error
 	Frontend(h Handler) error
 	Backend() error
 }
