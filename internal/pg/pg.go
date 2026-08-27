@@ -87,8 +87,9 @@ type session struct {
 	uw        *bufio.Writer
 	recorder  wire.Recorder
 	pending   bytes.Buffer
-	forwarded bool // part of the current batch was already sent upstream
-	denied    bool // a statement in the current batch was denied
+	batch     []string // SQL of the allowed Parses staged in the current batch, awaiting Sync
+	forwarded bool     // part of the current batch was already sent upstream
+	denied    bool     // a statement in the current batch was denied
 
 	// Backend goroutine only.
 	ur        *bufio.Reader
@@ -202,8 +203,17 @@ func (s *session) Frontend(h wire.Handler, rec wire.Recorder) error {
 }
 
 // Backend relays upstream messages and settles the request queue on every
-// ReadyForQuery, writing any denials that were waiting their turn.
+// ReadyForQuery, writing any denials that were waiting their turn. On exit it
+// finalizes records for statements still in flight, so a session that ends
+// before a ReadyForQuery still records what it sent.
 func (s *session) Backend() error {
+	err := s.backend()
+	s.finishInFlight()
+
+	return err
+}
+
+func (s *session) backend() error {
 	for {
 		if s.ur.Buffered() == 0 {
 			if err := s.flushClient(); err != nil {
@@ -364,6 +374,8 @@ func (s *session) parse(h wire.Handler, n uint32) error {
 		if err := discard(s.cr, n); err != nil {
 			return err
 		}
+		s.record("", wire.Denied)
+		s.batch = nil
 
 		return s.denyBatch(s.tooLarge(n))
 	}
@@ -380,10 +392,13 @@ func (s *session) parse(h wire.Handler, n uint32) error {
 
 	if v := h.Statement(wire.Statement{SQL: sql}); v.Deny {
 		s.record(sql, wire.Denied)
+		s.batch = nil // the batch is rejected; earlier allowed statements never run
 
 		return s.denyBatch(denial(v))
 	}
-	s.record(sql, wire.Allowed)
+	// Defer recording until Sync: a later denial rejects the whole batch, and an
+	// allowed statement is only real once its batch reaches Sync.
+	s.batch = append(s.batch, sql)
 
 	return s.stage(typeParse, body)
 }
@@ -462,17 +477,37 @@ func (s *session) sync(n uint32) error {
 		}
 	}
 
+	answer := slot{forwarded: true}
+	if !s.denied {
+		answer.result = s.recordBatch()
+	}
+	s.batch = nil
 	s.denied = false
 	s.forwarded = false
 
 	// Enqueue before the Sync reaches the upstream, so Backend never sees the
 	// ReadyForQuery before the slot that accounts for it.
-	s.enqueue(slot{forwarded: true})
+	s.enqueue(answer)
 	if err := writeMessage(s.uw, typeSync, nil); err != nil {
 		return err
 	}
 
 	return flush(s.uw)
+}
+
+// recordBatch records the allowed statements accumulated in the current batch.
+// A single-statement batch returns a result so its row count is captured; a
+// multi-statement batch records each statement now, since results cannot be
+// split between them yet.
+func (s *session) recordBatch() wire.Result {
+	if len(s.batch) == 1 {
+		return s.begin(s.batch[0], wire.Allowed)
+	}
+	for _, sql := range s.batch {
+		s.record(sql, wire.Allowed)
+	}
+
+	return nil
 }
 
 func (s *session) functionCall(n uint32) error {
@@ -697,6 +732,12 @@ func (s *session) record(sql string, decision wire.Decision) {
 // describeResult forwards a RowDescription and tells the current result which
 // columns to capture.
 func (s *session) describeResult(n uint32) error {
+	s.curResult = nil
+	s.curCap = nil
+	if !s.recording() {
+		return s.forwardToClient(typeRowDescription, n) // nothing records; stream it
+	}
+
 	body, err := readBody(s.ur, n)
 	if err != nil {
 		return err
@@ -707,7 +748,6 @@ func (s *session) describeResult(n uint32) error {
 		return err
 	}
 	s.curResult = res
-	s.curCap = nil
 	if res != nil {
 		s.curCap = res.Columns(columnNames(body))
 	}
@@ -736,6 +776,10 @@ func (s *session) rowResult(n uint32) error {
 
 // completeResult forwards a CommandComplete and adds its row count to the result.
 func (s *session) completeResult(n uint32) error {
+	if !s.recording() {
+		return s.forwardToClient(typeCommandComplete, n) // nothing records; stream it
+	}
+
 	body, err := readBody(s.ur, n)
 	if err != nil {
 		return err
@@ -767,6 +811,33 @@ func (s *session) forwardResult(typ byte, body []byte) (wire.Result, error) {
 	}
 
 	return res, nil
+}
+
+// recording reports whether the request currently being answered has a result
+// to record, so results are only materialized when the ledger needs them.
+func (s *session) recording() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return len(s.queue) > 0 && s.queue[0].forwarded && s.queue[0].result != nil
+}
+
+// finishInFlight finalizes the records of forwarded requests still queued when
+// the session ends, so their records are written even without a ReadyForQuery.
+func (s *session) finishInFlight() {
+	s.mu.Lock()
+	var pending []wire.Result
+	for _, sl := range s.queue {
+		if sl.forwarded && sl.result != nil {
+			pending = append(pending, sl.result)
+		}
+	}
+	s.queue = nil
+	s.mu.Unlock()
+
+	for _, r := range pending {
+		r.Done()
+	}
 }
 
 func (s *session) flushClient() error {

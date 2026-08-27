@@ -838,6 +838,100 @@ func TestFrontendRecordsDenial(t *testing.T) {
 	}
 }
 
+func TestFrontendRecordsExtendedSingleStatement(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	batch := bytes.Join([][]byte{pMsg("select id from t"), bindMsg, execMsg, syncMsg}, nil)
+	reply := [][]byte{
+		msg('1'), msg('2'),
+		msg('T', be16(1), cstr("id"), be32(0), be16(0), be32(23), be16(4), be32(0xffffffff), be16(0)),
+		msg('D', be16(1), be32(1), []byte("7")),
+		msg('C', cstr("SELECT 1")),
+		msg('Z', []byte("I")),
+	}
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, batch); err != nil {
+			return err
+		}
+
+		return write(s, reply...)
+	})
+
+	mustWrite(t, p.client, batch)
+	for _, want := range reply {
+		expectMsg(t, p.client, want)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d, want 1", len(records))
+	}
+	if r := records[0]; r.sql != "select id from t" || r.decision != wire.Allowed || r.rows != 1 || !r.done {
+		t.Errorf("record: got %+v, want allowed select id from t with 1 row", r)
+	}
+}
+
+func TestFrontendRecordsOnlyTheDenialOfARejectedBatch(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(denyContaining("delete"), capturingRecorder{records: &records})
+
+	// An allowed Parse precedes a denied one; the batch is rejected, so only the
+	// denial is recorded and the earlier statement, which never ran, is not.
+	batch := bytes.Join([][]byte{
+		pMsg("select 1"), bindMsg, execMsg,
+		pMsg("delete from t"), bindMsg, execMsg,
+		syncMsg,
+	}, nil)
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, syncMsg); err != nil {
+			return err
+		}
+
+		return write(s, msg('Z', []byte("I")))
+	})
+
+	mustWrite(t, p.client, batch)
+	if typ, _ := readMsgT(t, p.client); typ != 'E' {
+		t.Fatal("expected ErrorResponse for the denied batch")
+	}
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d (%+v), want 1", len(records), records)
+	}
+	if r := records[0]; r.sql != "delete from t" || r.decision != wire.Denied {
+		t.Errorf("record: got %+v, want the delete recorded as denied", r)
+	}
+}
+
 // pipes connects a session to a fake client and a fake upstream over net.Pipe.
 type pipes struct {
 	sess     wire.Session
