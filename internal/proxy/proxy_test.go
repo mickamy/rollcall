@@ -149,7 +149,7 @@ func (rawSession) Prime(string) error {
 	return nil
 }
 
-func (s rawSession) Frontend(wire.Handler) error {
+func (s rawSession) Frontend(wire.Handler, wire.Recorder) error {
 	if _, err := io.Copy(s.upstream, s.client); err != nil {
 		return fmt.Errorf("frontend: %w", err)
 	}

@@ -28,21 +28,26 @@ const (
 )
 
 const (
-	typeQuery          = 'Q'
-	typeParse          = 'P'
-	typeBind           = 'B'
-	typeDescribe       = 'D'
-	typeExecute        = 'E'
-	typeClose          = 'C'
-	typeFlush          = 'H'
-	typeSync           = 'S'
-	typeFunctionCall   = 'F'
-	typeTerminate      = 'X'
-	typePassword       = 'p'
-	typeAuthentication = 'R'
-	typeErrorResponse  = 'E'
-	typeReadyForQuery  = 'Z'
-	typeCopyInResponse = 'G'
+	typeQuery           = 'Q'
+	typeParse           = 'P'
+	typeBind            = 'B'
+	typeDescribe        = 'D'
+	typeExecute         = 'E'
+	typeClose           = 'C'
+	typeFlush           = 'H'
+	typeSync            = 'S'
+	typeFunctionCall    = 'F'
+	typeTerminate       = 'X'
+	typePassword        = 'p'
+	typeAuthentication  = 'R'
+	typeErrorResponse   = 'E'
+	typeReadyForQuery   = 'Z'
+	typeCopyInResponse  = 'G'
+	typeRowDescription  = 'T'
+	typeDataRow         = 'D'
+	typeCommandComplete = 'C'
+	typeEmptyQuery      = 'I'
+	typePortalSuspended = 's'
 )
 
 const (
@@ -192,6 +197,73 @@ func flush(w *bufio.Writer) error {
 	}
 
 	return nil
+}
+
+// columnNames reads the field names from a RowDescription body.
+func columnNames(body []byte) []string {
+	if len(body) < 2 {
+		return nil
+	}
+	count := int(binary.BigEndian.Uint16(body))
+	body = body[2:]
+
+	names := make([]string, 0, count)
+	for range count {
+		name, rest, err := cstring(body)
+		if err != nil {
+			break
+		}
+		names = append(names, name)
+		if len(rest) < 18 { // tableOID(4) col(2) typeOID(4) len(2) mod(4) format(2)
+			break
+		}
+		body = rest[18:]
+	}
+
+	return names
+}
+
+// rowValues reads the values of the given column indices from a DataRow body.
+// A null column yields a nil slice.
+func rowValues(body []byte, capture []int) [][]byte {
+	if len(body) < 2 {
+		return nil
+	}
+	count := int(binary.BigEndian.Uint16(body))
+	body = body[2:]
+
+	fields := make([][]byte, 0, count)
+	for range count {
+		if len(body) < 4 {
+			break
+		}
+		n := int32(binary.BigEndian.Uint32(body)) //nolint:gosec // length is a signed int32 by protocol
+		body = body[4:]
+		if n < 0 {
+			fields = append(fields, nil)
+
+			continue
+		}
+		if len(body) < int(n) {
+			break
+		}
+		fields = append(fields, body[:n])
+		body = body[n:]
+	}
+
+	out := make([][]byte, 0, len(capture))
+	for _, c := range capture {
+		if c >= 0 && c < len(fields) {
+			out = append(out, fields[c])
+		}
+	}
+
+	return out
+}
+
+// commandTag reads the tag from a CommandComplete body, dropping its terminator.
+func commandTag(body []byte) string {
+	return string(bytes.TrimSuffix(body, []byte{0}))
 }
 
 func cstring(b []byte) (s string, rest []byte, err error) {

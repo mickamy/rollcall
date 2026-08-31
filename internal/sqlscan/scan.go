@@ -36,6 +36,8 @@ func tokenize(sql string) [][]token {
 			i = skipLineComment(sql, i+2)
 		case c == '/' && i+1 < n && sql[i+1] == '*':
 			i = skipBlockComment(sql, i+2)
+		case (c == 'e' || c == 'E') && i+1 < n && sql[i+1] == '\'':
+			i = skipEString(sql, i+2)
 		case c == '\'':
 			i = skipString(sql, i+1)
 		case c == '"':
@@ -129,6 +131,30 @@ func skipString(s string, i int) int {
 // skipDollarQuote skips a $tag$...$tag$ body. It reports false when the dollar
 // does not open a valid tag (for example a $1 parameter), leaving it to the
 // caller.
+// skipEString skips a PostgreSQL escape string E'...', whose opening quote at
+// i-1 has been consumed. A backslash escapes the next byte, and ” still stands
+// for a quote.
+func skipEString(s string, i int) int {
+	for i < len(s) {
+		switch s[i] {
+		case '\\':
+			i += 2
+		case '\'':
+			if i+1 < len(s) && s[i+1] == '\'' {
+				i += 2
+
+				continue
+			}
+
+			return i + 1
+		default:
+			i++
+		}
+	}
+
+	return i
+}
+
 func skipDollarQuote(s string, i int) (int, bool) {
 	j := i + 1
 	for j < len(s) && isTagPart(s[j]) {

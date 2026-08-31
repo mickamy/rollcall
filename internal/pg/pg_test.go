@@ -708,6 +708,529 @@ func TestDenyAfterEarlyForwardTearsDownTheSession(t *testing.T) {
 	<-backend
 }
 
+type capture struct {
+	sql      string
+	decision wire.Decision
+	rows     int
+	done     bool
+}
+
+type capturingRecorder struct{ records *[]*capture }
+
+func (r capturingRecorder) Begin(sql string, d wire.Decision) wire.Result {
+	c := &capture{sql: sql, decision: d}
+	*r.records = append(*r.records, c)
+
+	return c
+}
+
+func (capture) Columns([]string) []int { return nil }
+func (capture) Row([][]byte)           {}
+func (c *capture) Complete(tag string) { c.rows += tagRows(tag) }
+func (c *capture) Done()               { c.done = true }
+
+func tagRows(tag string) int {
+	fields := splitSpace(tag)
+	if len(fields) == 0 {
+		return 0
+	}
+
+	n := 0
+	for _, c := range fields[len(fields)-1] {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+
+	return n
+}
+
+func splitSpace(s string) []string {
+	var out []string
+	cur := ""
+	for _, c := range s {
+		if c == ' ' {
+			if cur != "" {
+				out = append(out, cur)
+				cur = ""
+			}
+
+			continue
+		}
+		cur += string(c)
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+
+	return out
+}
+
+func TestFrontendRecordsSimpleQueryOutcome(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	query := msg('Q', cstr("select id from t"))
+	reply := [][]byte{
+		msg('T', be16(1), cstr("id"), be32(0), be16(0), be32(23), be16(4), be32(0xffffffff), be16(0)),
+		msg('D', be16(1), be32(1), []byte("7")),
+		msg('D', be16(1), be32(1), []byte("8")),
+		msg('C', cstr("SELECT 2")),
+		msg('Z', []byte("I")),
+	}
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, query); err != nil {
+			return err
+		}
+
+		return write(s, reply...)
+	})
+
+	mustWrite(t, p.client, query)
+	for _, want := range reply {
+		expectMsg(t, p.client, want)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d, want 1", len(records))
+	}
+	rec := records[0]
+	if rec.sql != "select id from t" || rec.decision != wire.Allowed || rec.rows != 2 || !rec.done {
+		t.Errorf("record: got %+v, want allowed select with 2 rows, done", rec)
+	}
+}
+
+func TestFrontendRecordsDenial(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	var records []*capture
+	done := p.frontendRec(denyContaining("delete"), capturingRecorder{records: &records})
+
+	mustWrite(t, p.client, msg('Q', cstr("delete from t")))
+	if typ, _ := readMsgT(t, p.client); typ != 'E' {
+		t.Fatal("expected ErrorResponse")
+	}
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+
+	mustWrite(t, p.client, msg('X'))
+	expectMsg(t, p.upstream, msg('X'))
+	<-done
+
+	if len(records) != 1 || records[0].decision != wire.Denied || !records[0].done {
+		t.Errorf("records: got %+v, want one denied+done record", records)
+	}
+}
+
+func TestFrontendRecordsExtendedSingleStatement(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	batch := bytes.Join([][]byte{pMsg("select id from t"), bindMsg, execMsg, syncMsg}, nil)
+	reply := [][]byte{
+		msg('1'), msg('2'),
+		msg('T', be16(1), cstr("id"), be32(0), be16(0), be32(23), be16(4), be32(0xffffffff), be16(0)),
+		msg('D', be16(1), be32(1), []byte("7")),
+		msg('C', cstr("SELECT 1")),
+		msg('Z', []byte("I")),
+	}
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, batch); err != nil {
+			return err
+		}
+
+		return write(s, reply...)
+	})
+
+	mustWrite(t, p.client, batch)
+	for _, want := range reply {
+		expectMsg(t, p.client, want)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d, want 1", len(records))
+	}
+	if r := records[0]; r.sql != "select id from t" || r.decision != wire.Allowed || r.rows != 1 || !r.done {
+		t.Errorf("record: got %+v, want allowed select id from t with 1 row", r)
+	}
+}
+
+func TestFrontendRecordsOnlyTheDenialOfARejectedBatch(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(denyContaining("delete"), capturingRecorder{records: &records})
+
+	// An allowed Parse precedes a denied one; the batch is rejected, so only the
+	// denial is recorded and the earlier statement, which never ran, is not.
+	batch := bytes.Join([][]byte{
+		pMsg("select 1"), bindMsg, execMsg,
+		pMsg("delete from t"), bindMsg, execMsg,
+		syncMsg,
+	}, nil)
+	server := p.serve(func(s net.Conn) error {
+		if err := expectBytes(s, syncMsg); err != nil {
+			return err
+		}
+
+		return write(s, msg('Z', []byte("I")))
+	})
+
+	mustWrite(t, p.client, batch)
+	if typ, _ := readMsgT(t, p.client); typ != 'E' {
+		t.Fatal("expected ErrorResponse for the denied batch")
+	}
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d (%+v), want 1", len(records), records)
+	}
+	if r := records[0]; r.sql != "delete from t" || r.decision != wire.Denied {
+		t.Errorf("record: got %+v, want the delete recorded as denied", r)
+	}
+}
+
+func namedParse(name, sql string) []byte {
+	return msg('P', cstr(name), cstr(sql), be16(0))
+}
+
+func namedBind(portal, stmt string) []byte {
+	return msg('B', cstr(portal), cstr(stmt), be16(0), be16(0), be16(0))
+}
+
+// TestFrontendRecordsReExecutionOfAPreparedStatement is the driver case: the
+// statement is prepared once, then re-executed in a later batch with no Parse.
+// Both executions must be recorded.
+func TestFrontendRecordsReExecutionOfAPreparedStatement(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	prepare := bytes.Join([][]byte{namedParse("s1", "select id from t"), namedBind("", "s1"), execMsg, syncMsg}, nil)
+	reuse := bytes.Join([][]byte{namedBind("", "s1"), execMsg, syncMsg}, nil)
+	result := func(withParse bool) [][]byte {
+		out := [][]byte{}
+		if withParse {
+			out = append(out, msg('1'))
+		}
+		out = append(out,
+			msg('2'),
+			msg('T', be16(1), cstr("id"), be32(0), be16(0), be32(23), be16(4), be32(0xffffffff), be16(0)),
+			msg('D', be16(1), be32(1), []byte("7")),
+			msg('C', cstr("SELECT 1")),
+			msg('Z', []byte("I")),
+		)
+
+		return out
+	}
+
+	server := p.serve(func(sc net.Conn) error {
+		if err := expectBytes(sc, prepare); err != nil {
+			return err
+		}
+		if err := write(sc, result(true)...); err != nil {
+			return err
+		}
+		if err := expectBytes(sc, reuse); err != nil {
+			return err
+		}
+
+		return write(sc, result(false)...)
+	})
+
+	mustWrite(t, p.client, prepare)
+	for _, w := range result(true) {
+		expectMsg(t, p.client, w)
+	}
+	mustWrite(t, p.client, reuse)
+	for _, w := range result(false) {
+		expectMsg(t, p.client, w)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 2 {
+		t.Fatalf("records: got %d, want 2 (prepare+reuse)", len(records))
+	}
+	for i, r := range records {
+		if r.sql != "select id from t" || r.decision != wire.Allowed || r.rows != 1 || !r.done {
+			t.Errorf("record %d: got %+v, want allowed select id from t, 1 row", i, r)
+		}
+	}
+}
+
+// TestFrontendDoesNotRecordAPrepareOnlyBatch checks that preparing a statement
+// without executing it is not recorded as an execution.
+func TestFrontendDoesNotRecordAPrepareOnlyBatch(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	batch := bytes.Join([][]byte{namedParse("s1", "select id from t"), msg('D', []byte("S"), cstr("s1")), syncMsg}, nil)
+	reply := [][]byte{
+		msg('1'),
+		msg('t', be16(0)),
+		msg('T', be16(1), cstr("id"), be32(0), be16(0), be32(23), be16(4), be32(0xffffffff), be16(0)),
+		msg('Z', []byte("I")),
+	}
+	server := p.serve(func(sc net.Conn) error {
+		if err := expectBytes(sc, batch); err != nil {
+			return err
+		}
+
+		return write(sc, reply...)
+	})
+
+	mustWrite(t, p.client, batch)
+	for _, w := range reply {
+		expectMsg(t, p.client, w)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 0 {
+		t.Errorf("records: got %d (%+v), want 0 for a prepare-only batch", len(records), records)
+	}
+}
+
+func execPortal(portal string) []byte {
+	return msg('E', cstr(portal), be32(0))
+}
+
+// TestExecuteOfAnUnknownPortalIsNotMisattributed guards against resolving an
+// unknown portal to the unnamed prepared statement.
+func TestExecuteOfAnUnknownPortalIsNotMisattributed(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	prepare := bytes.Join([][]byte{namedParse("", "select id from t"), namedBind("", ""), execMsg, syncMsg}, nil)
+	ghost := bytes.Join([][]byte{execPortal("ghost"), syncMsg}, nil)
+	commandZ := [][]byte{msg('C', cstr("SELECT 1")), msg('Z', []byte("I"))}
+
+	server := p.serve(func(sc net.Conn) error {
+		if err := expectBytes(sc, prepare); err != nil {
+			return err
+		}
+		if err := write(sc, commandZ...); err != nil {
+			return err
+		}
+		if err := expectBytes(sc, ghost); err != nil {
+			return err
+		}
+
+		return write(sc, msg('C', cstr("SELECT 0")), msg('Z', []byte("I")))
+	})
+
+	mustWrite(t, p.client, prepare)
+	for _, w := range commandZ {
+		expectMsg(t, p.client, w)
+	}
+	mustWrite(t, p.client, ghost)
+	expectMsg(t, p.client, msg('C', cstr("SELECT 0")))
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d (%+v), want 1 (the unknown-portal Execute must not record)", len(records), records)
+	}
+	if records[0].sql != "select id from t" {
+		t.Errorf("record: got sql %q, want the prepared statement", records[0].sql)
+	}
+}
+
+// TestUnrecordedExecuteDoesNotStealTheNextResult checks that a placeholder keeps
+// an unrecorded Execute's result set from being credited to a later record.
+func TestUnrecordedExecuteDoesNotStealTheNextResult(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	// One batch: an Execute of an unbound portal (unresolved), then an Execute of
+	// a freshly prepared statement. The server returns a result set for each.
+	batch := bytes.Join([][]byte{
+		namedBind("p1", "nope"), execPortal("p1"),
+		namedParse("s2", "select v from t"), namedBind("p2", "s2"), execPortal("p2"),
+		syncMsg,
+	}, nil)
+	reply := [][]byte{
+		msg('C', cstr("SELECT 5")), // for the unresolved Execute
+		msg('C', cstr("SELECT 3")), // for the recorded Execute
+		msg('Z', []byte("I")),
+	}
+	server := p.serve(func(sc net.Conn) error {
+		if err := expectBytes(sc, batch); err != nil {
+			return err
+		}
+
+		return write(sc, reply...)
+	})
+
+	mustWrite(t, p.client, batch)
+	for _, w := range reply {
+		expectMsg(t, p.client, w)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Fatalf("records: got %d, want 1", len(records))
+	}
+	if records[0].sql != "select v from t" || records[0].rows != 3 {
+		t.Errorf("record: got %+v, want select v from t with 3 rows (not the unresolved Execute's 5)", records[0])
+	}
+}
+
+// TestCloseForgetsThePreparedStatement checks that after a Close, re-executing
+// the statement's old name is no longer attributed to it.
+func TestCloseForgetsThePreparedStatement(t *testing.T) {
+	t.Parallel()
+
+	p := newPipes(t, pg.Dialect{})
+	p.connect(t, "user", "alice")
+	backend := p.backend()
+
+	var records []*capture
+	frontend := p.frontendRec(allow, capturingRecorder{records: &records})
+
+	// Prepare s1, then close it; a later Bind/Execute of s1 must not record.
+	prepare := bytes.Join([][]byte{namedParse("s1", "select id from t"), namedBind("", "s1"), execMsg, syncMsg}, nil)
+	closeIt := bytes.Join([][]byte{msg('C', []byte("S"), cstr("s1")), syncMsg}, nil)
+	reuse := bytes.Join([][]byte{namedBind("", "s1"), execMsg, syncMsg}, nil)
+	commandZ := [][]byte{msg('C', cstr("SELECT 1")), msg('Z', []byte("I"))}
+
+	server := p.serve(func(sc net.Conn) error {
+		if err := expectBytes(sc, prepare); err != nil {
+			return err
+		}
+		if err := write(sc, commandZ...); err != nil {
+			return err
+		}
+		if err := expectBytes(sc, closeIt); err != nil {
+			return err
+		}
+		if err := write(sc, msg('3'), msg('Z', []byte("I"))); err != nil { // CloseComplete, ReadyForQuery
+			return err
+		}
+		if err := expectBytes(sc, reuse); err != nil {
+			return err
+		}
+
+		return write(sc, commandZ...)
+	})
+
+	mustWrite(t, p.client, prepare)
+	for _, w := range commandZ {
+		expectMsg(t, p.client, w)
+	}
+	mustWrite(t, p.client, closeIt)
+	expectMsg(t, p.client, msg('3'))
+	expectMsg(t, p.client, msg('Z', []byte("I")))
+	mustWrite(t, p.client, reuse)
+	for _, w := range commandZ {
+		expectMsg(t, p.client, w)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("fake server: %v", err)
+	}
+
+	_ = p.client.Close()
+	_ = p.upstream.Close()
+	<-frontend
+	<-backend
+
+	if len(records) != 1 {
+		t.Errorf("records: got %d, want 1 (reuse after Close must not record)", len(records))
+	}
+}
+
 // pipes connects a session to a fake client and a fake upstream over net.Pipe.
 type pipes struct {
 	sess     wire.Session
@@ -746,8 +1269,12 @@ func (p pipes) handshake() <-chan handshakeResult {
 }
 
 func (p pipes) frontend(h wire.Handler) <-chan error {
+	return p.frontendRec(h, nil)
+}
+
+func (p pipes) frontendRec(h wire.Handler, rec wire.Recorder) <-chan error {
 	done := make(chan error, 1)
-	go func() { done <- p.sess.Frontend(h) }()
+	go func() { done <- p.sess.Frontend(h, rec) }()
 
 	return done
 }

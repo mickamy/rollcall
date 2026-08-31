@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/mickamy/rollcall/internal/cli"
 	"github.com/mickamy/rollcall/internal/exit"
+	"github.com/mickamy/rollcall/internal/ledger"
 )
 
 func TestRun(t *testing.T) {
@@ -238,6 +242,114 @@ func TestRunProxyServesPostgreSQL(t *testing.T) {
 	}
 }
 
+func TestRunProxyLedgerRecordsPreparedExecutions(t *testing.T) {
+	t.Parallel()
+
+	upstream := startFakePostgres(t)
+	ledgerPath := filepath.Join(t.TempDir(), "ledger.jsonl")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errOut := newNotifyWriter("msg=listening")
+	code := make(chan int, 1)
+	go func() {
+		args := []string{"proxy", "-upstream", upstream, "-listen", "127.0.0.1:0", "-ledger", ledgerPath}
+		code <- cli.Run(ctx, args, cli.IO{In: strings.NewReader(""), Out: io.Discard, Err: errOut})
+	}()
+
+	select {
+	case <-errOut.seen:
+	case c := <-code:
+		t.Fatalf("proxy exited with %d before listening", c)
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not start listening")
+	}
+	addr := regexp.MustCompile(`addr=(\S+)`).FindStringSubmatch(errOut.String())[1]
+
+	var dialer net.Dialer
+	client, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeAll(t, client, startupPacket("user", "agent", "database", "app"))
+	expectMessage(t, client, pgMessage('R', be32(0)))
+	expectMessage(t, client, pgMessage('Z', []byte("I")))
+
+	// Prepare once, then re-execute in a second batch that carries no Parse.
+	parse := pgMessage('P', cstring("ps1"), cstring("select id from t where id > $1"), be16(0))
+	bind := pgMessage('B', cstring(""), cstring("ps1"), be16(0), be16(0), be16(0))
+	exec := pgMessage('E', cstring(""), be32(0))
+	sync := pgMessage('S')
+	writeAll(t, client, bytes.Join([][]byte{parse, bind, exec, sync}, nil))
+	readUntilReadyForQuery(t, client)
+	writeAll(t, client, bytes.Join([][]byte{bind, exec, sync}, nil))
+	readUntilReadyForQuery(t, client)
+
+	writeAll(t, client, pgMessage('X'))
+	_, _ = client.Read(make([]byte, 1))
+	cancel()
+	<-code
+
+	records := readLedger(t, ledgerPath)
+	if len(records) != 2 {
+		t.Fatalf("ledger records: got %d, want 2 (prepare + reuse)", len(records))
+	}
+	for i, r := range records {
+		if r.Kind != "SELECT" || r.Decision != "allowed" || r.Rows != 1 {
+			t.Errorf("record %d: got %+v, want an allowed SELECT with 1 row", i, r)
+		}
+		if strings.Contains(r.Fingerprint, "1") {
+			t.Errorf("record %d fingerprint kept a literal: %q", i, r.Fingerprint)
+		}
+	}
+	if records[1].PrevHash != records[0].Hash {
+		t.Error("ledger records are not chained")
+	}
+}
+
+func readUntilReadyForQuery(t *testing.T, r io.Reader) {
+	t.Helper()
+
+	for {
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(r, header); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if _, err := io.CopyN(io.Discard, r, int64(binary.BigEndian.Uint32(header[1:]))-4); err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if header[0] == 'Z' {
+			return
+		}
+	}
+}
+
+func readLedger(t *testing.T, path string) []ledger.Record {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	var out []ledger.Record
+	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec ledger.Record
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("unmarshal %q: %v", line, err)
+		}
+		out = append(out, rec)
+	}
+
+	return out
+}
+
 // startFakePostgres serves trust authentication and answers every simple
 // query with "SELECT 1" until the client terminates.
 func startFakePostgres(t *testing.T) string {
@@ -293,6 +405,16 @@ func serveFakePostgres(conn net.Conn) {
 			if _, err := conn.Write(reply); err != nil {
 				return
 			}
+		case 'S': // Sync: answer the batch with a one-row result set
+			reply := bytes.Join([][]byte{
+				pgMessage('T', be16(1), cstring("id"), be32(0), be16(0), be32(23), be16(4), be32(0xffffffff), be16(0)),
+				pgMessage('D', be16(1), be32(1), []byte("7")),
+				pgMessage('C', cstring("SELECT 1")),
+				pgMessage('Z', []byte("I")),
+			}, nil)
+			if _, err := conn.Write(reply); err != nil {
+				return
+			}
 		case 'X':
 			return
 		}
@@ -301,6 +423,10 @@ func serveFakePostgres(conn net.Conn) {
 
 func be32(v uint32) []byte {
 	return binary.BigEndian.AppendUint32(nil, v)
+}
+
+func be16(v uint16) []byte {
+	return binary.BigEndian.AppendUint16(nil, v)
 }
 
 func cstring(s string) []byte {

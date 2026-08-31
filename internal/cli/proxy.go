@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 
 	"github.com/mickamy/rollcall/internal/exit"
+	"github.com/mickamy/rollcall/internal/ledger"
 	"github.com/mickamy/rollcall/internal/pg"
 	"github.com/mickamy/rollcall/internal/policy"
 	"github.com/mickamy/rollcall/internal/proxy"
@@ -21,6 +23,7 @@ const (
 	listenUsage   = "address to accept client connections on"
 	upstreamUsage = "address of the upstream database"
 	policyUsage   = "path to a policy file; without one every statement is allowed"
+	ledgerUsage   = "path to append the access ledger to as JSON lines; without one nothing is recorded"
 )
 
 func runProxy(ctx context.Context, args []string, std IO) int {
@@ -28,6 +31,7 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 	listen := fs.String("listen", defaultListen, listenUsage)
 	upstream := fs.String("upstream", "", upstreamUsage)
 	policyPath := fs.String("policy", "", policyUsage)
+	ledgerPath := fs.String("ledger", "", ledgerUsage)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exit.OK
@@ -57,6 +61,25 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 		guard = p
 	}
 
+	logger := slog.New(slog.NewTextHandler(std.Err, nil))
+
+	if *ledgerPath != "" {
+		prev, err := ledger.LastHash(*ledgerPath)
+		if err != nil {
+			return fail(std, err)
+		}
+
+		f, err := os.OpenFile(*ledgerPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fail(std, fmt.Errorf("open ledger: %w", err))
+		}
+		defer func() { _ = f.Close() }()
+
+		sink := ledger.NewSink(f, ledger.Options{Prev: prev, Key: ledgerKey(), Logger: logger})
+		defer sink.Close()
+		guard = ledger.Guard{Inner: guard, Sink: sink}
+	}
+
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", *listen)
 	if err != nil {
@@ -64,7 +87,6 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 	}
 	defer func() { _ = ln.Close() }()
 
-	logger := slog.New(slog.NewTextHandler(std.Err, nil))
 	logger.Info("listening", "addr", ln.Addr().String(), "upstream", *upstream)
 	if !isLoopback(*listen) {
 		logger.Warn("listening outside loopback: clients and the upstream are served in plaintext", "addr", *listen)
@@ -76,6 +98,16 @@ func runProxy(ctx context.Context, args []string, std IO) int {
 	}
 
 	return exit.OK
+}
+
+// ledgerKey returns the optional key that makes the ledger chain an HMAC,
+// from ROLLCALL_LEDGER_KEY. Without it the chain is a plain SHA-256.
+func ledgerKey() []byte {
+	if v := os.Getenv("ROLLCALL_LEDGER_KEY"); v != "" {
+		return []byte(v)
+	}
+
+	return nil
 }
 
 func validateAddr(flagName, addr string) error {
@@ -118,4 +150,5 @@ func printProxyUsage(w io.Writer) {
 	fmt.Fprintf(w, "  -upstream ADDR  %s (required)\n", upstreamUsage)
 	fmt.Fprintf(w, "  -listen ADDR    %s (default %q)\n", listenUsage, defaultListen)
 	fmt.Fprintf(w, "  -policy PATH    %s\n", policyUsage)
+	fmt.Fprintf(w, "  -ledger PATH    %s\n", ledgerUsage)
 }
