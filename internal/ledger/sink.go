@@ -117,9 +117,10 @@ func keyID(key []byte) string {
 		return ""
 	}
 
-	sum := sha256.Sum256(key)
+	m := hmac.New(sha256.New, key)
+	_, _ = m.Write([]byte("rollcall/ledger/key-id"))
 
-	return hex.EncodeToString(sum[:6])
+	return hex.EncodeToString(m.Sum(nil)[:8])
 }
 
 // hashRecord hashes the record with its Hash field cleared, so the chain covers

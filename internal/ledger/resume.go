@@ -63,15 +63,14 @@ func lastHashInTail(tail []byte, windowed bool) (string, error) {
 		var rec struct {
 			Hash string `json:"hash"`
 		}
-		if err := json.Unmarshal(line, &rec); err != nil {
-			if i == 0 && windowed {
-				return "", fmt.Errorf("ledger: last record exceeds %d bytes; cannot resume", tailWindow)
-			}
-
-			continue // a partial trailing write; try the record before it
+		if err := json.Unmarshal(line, &rec); err == nil && rec.Hash != "" {
+			return rec.Hash, nil
 		}
-
-		return rec.Hash, nil
+		// A partial trailing write, or a line with no hash; try the record before
+		// it, unless the tail window may have cut this first line short.
+		if i == 0 && windowed {
+			return "", fmt.Errorf("ledger: last record exceeds %d bytes; cannot resume", tailWindow)
+		}
 	}
 
 	return "", nil
