@@ -27,6 +27,10 @@ const (
 	// maxQueue bounds outstanding responses. Reaching it blocks the frontend
 	// until the backend drains one, applying backpressure like the server does.
 	maxQueue = 512
+	// maxPreparedCount and maxPreparedBytes bound the prepared-statement bookkeeping
+	// so a client cannot exhaust proxy memory by preparing statements without end.
+	maxPreparedCount = 8192
+	maxPreparedBytes = 16 << 20
 	// smallBody bounds the messages Backend reads fully before taking the
 	// client write lock, so a stalled upstream cannot hold denials hostage.
 	smallBody = 32 << 10
@@ -92,7 +96,8 @@ type session struct {
 	pending      bytes.Buffer
 	prepared     map[string]string // prepared statement name -> SQL
 	portals      map[string]string // portal name -> prepared statement name
-	pendingExecs []string          // SQL of the Executes staged in the current batch, awaiting Sync
+	pendingExecs []string          // SQL (or "" when unresolved) of each Execute in the current batch
+	preparedSize int               // total bytes of SQL held in prepared, bounded by maxPreparedBytes
 	forwarded    bool              // part of the current batch was already sent upstream
 	denied       bool              // a statement in the current batch was denied
 
@@ -317,7 +322,9 @@ func (s *session) dispatch(h wire.Handler, typ byte, n uint32) (bool, error) {
 		return false, s.bind(n)
 	case typeExecute:
 		return false, s.execute(n)
-	case typeDescribe, typeClose:
+	case typeClose:
+		return false, s.closePrepared(n)
+	case typeDescribe:
 		return false, s.buffer(typ, n)
 	case typeFlush:
 		return false, s.flushBatch(n)
@@ -411,7 +418,7 @@ func (s *session) parse(h wire.Handler, n uint32) error {
 	}
 	// Remember the prepared statement so its later Executes, which carry no SQL,
 	// can be attributed even across batches (driver statement caches reuse it).
-	s.prepared[name] = sql
+	s.storePrepared(name, sql)
 
 	return s.stage(typeParse, body)
 }
@@ -435,8 +442,10 @@ func (s *session) bind(n uint32) error {
 	if err != nil {
 		return err
 	}
-	if portal, stmt, ok := parseBind(body); ok {
-		s.portals[portal] = stmt
+	if portal, stmt, ok := parseBind(body); ok && s.recorder != nil {
+		if _, exists := s.portals[portal]; exists || len(s.portals) < maxPreparedCount {
+			s.portals[portal] = stmt
+		}
 	}
 
 	return s.stage(typeBind, body)
@@ -453,6 +462,7 @@ func (s *session) execute(n uint32) error {
 			return err
 		}
 		s.forwarded = true
+		s.stageExec("") // forwarded without inspection; a placeholder keeps results aligned
 
 		return forward(s.uw, typeExecute, n, s.cr)
 	}
@@ -461,13 +471,86 @@ func (s *session) execute(n uint32) error {
 	if err != nil {
 		return err
 	}
-	if portal, ok := parsePortal(body); ok {
-		if sql, ok := s.prepared[s.portals[portal]]; ok {
-			s.pendingExecs = append(s.pendingExecs, sql)
+	s.stageExec(s.resolveExec(body))
+
+	return s.stage(typeExecute, body)
+}
+
+// resolveExec returns the SQL an Execute runs, or "" when its portal is unknown.
+func (s *session) resolveExec(body []byte) string {
+	portal, ok := parsePortal(body)
+	if !ok {
+		return ""
+	}
+	stmt, ok := s.portals[portal]
+	if !ok {
+		return ""
+	}
+
+	return s.prepared[stmt]
+}
+
+// stageExec records one Execute in the current batch, keeping a placeholder for
+// every Execute so its result set maps to the right record. Only tracked when a
+// recorder is set.
+func (s *session) stageExec(sql string) {
+	if s.recorder == nil {
+		return
+	}
+	s.pendingExecs = append(s.pendingExecs, sql)
+}
+
+// storePrepared records a prepared statement's SQL for later Execute attribution,
+// bounded so the map cannot grow without limit. Tracked only when recording.
+func (s *session) storePrepared(name, sql string) {
+	if s.recorder == nil {
+		return
+	}
+	if old, ok := s.prepared[name]; ok {
+		s.preparedSize -= len(old)
+	}
+	if len(s.prepared) >= maxPreparedCount || s.preparedSize+len(sql) > maxPreparedBytes {
+		delete(s.prepared, name) // at the limit: stop tracking this name rather than grow
+		return
+	}
+	s.prepared[name] = sql
+	s.preparedSize += len(sql)
+}
+
+// closePrepared handles a Close message, dropping the named statement or portal
+// from the maps so the server's release is mirrored, then stages the message.
+func (s *session) closePrepared(n uint32) error {
+	if s.denied {
+		return discard(s.cr, n)
+	}
+	if s.forwarded || int64(n) > maxPending {
+		if err := s.forwardPending(); err != nil {
+			return err
+		}
+		s.forwarded = true
+
+		return forward(s.uw, typeClose, n, s.cr)
+	}
+
+	body, err := readBody(s.cr, n)
+	if err != nil {
+		return err
+	}
+	if s.recorder != nil && len(body) > 1 {
+		if name, _, err := cstring(body[1:]); err == nil {
+			switch body[0] {
+			case 'S':
+				if sql, ok := s.prepared[name]; ok {
+					s.preparedSize -= len(sql)
+					delete(s.prepared, name)
+				}
+			case 'P':
+				delete(s.portals, name)
+			}
 		}
 	}
 
-	return s.stage(typeExecute, body)
+	return s.stage(typeClose, body)
 }
 
 func (s *session) buffer(typ byte, n uint32) error {
@@ -572,15 +655,15 @@ func (s *session) enqueueExecs() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	count := 0
 	for _, sql := range s.pendingExecs {
-		if r := s.begin(sql, wire.Allowed); r != nil {
-			s.execQueue = append(s.execQueue, r)
-			count++
+		var r wire.Result
+		if sql != "" {
+			r = s.begin(sql, wire.Allowed)
 		}
+		s.execQueue = append(s.execQueue, r) // nil keeps an unrecorded Execute in position
 	}
 
-	return count
+	return len(s.pendingExecs)
 }
 
 func (s *session) functionCall(n uint32) error {
@@ -722,7 +805,9 @@ func (s *session) readyForQuery(n uint32) error {
 	var finishing []wire.Result
 	defer func() {
 		for _, r := range finishing {
-			r.Done()
+			if r != nil {
+				r.Done()
+			}
 		}
 	}()
 
@@ -939,7 +1024,7 @@ func (s *session) targetLocked() wire.Result {
 	if s.queue[0].simple {
 		return s.queue[0].result
 	}
-	if s.execIdx < len(s.execQueue) {
+	if s.execIdx < s.queue[0].execCount && s.execIdx < len(s.execQueue) {
 		return s.execQueue[s.execIdx]
 	}
 
@@ -971,7 +1056,9 @@ func (s *session) finishInFlight() {
 	s.mu.Unlock()
 
 	for _, r := range pending {
-		r.Done()
+		if r != nil {
+			r.Done()
+		}
 	}
 }
 
