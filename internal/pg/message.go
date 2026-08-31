@@ -46,6 +46,8 @@ const (
 	typeRowDescription  = 'T'
 	typeDataRow         = 'D'
 	typeCommandComplete = 'C'
+	typeEmptyQuery      = 'I'
+	typePortalSuspended = 's'
 )
 
 const (

@@ -58,6 +58,8 @@ func (d Dialect) NewSession(client, upstream net.Conn) wire.Session {
 		ur:           bufio.NewReaderSize(upstream, readBufferSize),
 		uw:           bufio.NewWriterSize(upstream, writeBufferSize),
 		small:        make([]byte, smallBody),
+		prepared:     make(map[string]string),
+		portals:      make(map[string]string),
 	}
 	s.drained = sync.NewCond(&s.mu)
 
@@ -73,6 +75,7 @@ type slot struct {
 	forwarded bool
 	simple    bool
 	result    wire.Result
+	execCount int // extended-protocol Executes whose records this slot finalizes
 	code      string
 	message   string
 	hint      string
@@ -83,28 +86,31 @@ type session struct {
 	maxStatement uint32
 
 	// Frontend goroutine only.
-	cr        *bufio.Reader
-	uw        *bufio.Writer
-	recorder  wire.Recorder
-	pending   bytes.Buffer
-	batch     []string // SQL of the allowed Parses staged in the current batch, awaiting Sync
-	forwarded bool     // part of the current batch was already sent upstream
-	denied    bool     // a statement in the current batch was denied
+	cr           *bufio.Reader
+	uw           *bufio.Writer
+	recorder     wire.Recorder
+	pending      bytes.Buffer
+	prepared     map[string]string // prepared statement name -> SQL
+	portals      map[string]string // portal name -> prepared statement name
+	pendingExecs []string          // SQL of the Executes staged in the current batch, awaiting Sync
+	forwarded    bool              // part of the current batch was already sent upstream
+	denied       bool              // a statement in the current batch was denied
 
 	// Backend goroutine only.
-	ur        *bufio.Reader
-	small     []byte
-	curResult wire.Result // the result currently streaming from the upstream
-	curCap    []int       // columns the recorder asked to capture for it
+	ur      *bufio.Reader
+	small   []byte
+	curCap  []int // columns the recorder asked to capture for the current result set
+	execIdx int   // index of the extended-protocol Execute currently answering
 
 	// mu serializes writes to the client, which Frontend (denials) and Backend
 	// (forwarded messages) both perform, and guards tx and queue alongside them.
 	// drained wakes the frontend when the backend frees a queue slot.
-	mu      sync.Mutex
-	drained *sync.Cond
-	cw      *bufio.Writer
-	tx      byte
-	queue   []slot
+	mu        sync.Mutex
+	drained   *sync.Cond
+	cw        *bufio.Writer
+	tx        byte
+	queue     []slot
+	execQueue []wire.Result // extended-protocol Execute records awaiting their results
 }
 
 func (s *session) Handshake() (wire.Startup, error) {
@@ -245,6 +251,8 @@ func (s *session) backend() error {
 			err = s.rowResult(n)
 		case typeCommandComplete:
 			err = s.completeResult(n)
+		case typeEmptyQuery, typePortalSuspended:
+			err = s.endResult(typ, n)
 		default:
 			err = s.forwardToClient(typ, n)
 		}
@@ -305,7 +313,11 @@ func (s *session) dispatch(h wire.Handler, typ byte, n uint32) (bool, error) {
 		return false, s.query(h, n)
 	case typeParse:
 		return false, s.parse(h, n)
-	case typeBind, typeDescribe, typeExecute, typeClose:
+	case typeBind:
+		return false, s.bind(n)
+	case typeExecute:
+		return false, s.execute(n)
+	case typeDescribe, typeClose:
 		return false, s.buffer(typ, n)
 	case typeFlush:
 		return false, s.flushBatch(n)
@@ -339,6 +351,7 @@ func (s *session) query(h wire.Handler, n uint32) error {
 		if err := discard(s.cr, n); err != nil {
 			return err
 		}
+		s.recordDenied("")
 
 		return s.respond(readySlot(s.tooLarge(n)))
 	}
@@ -350,7 +363,7 @@ func (s *session) query(h wire.Handler, n uint32) error {
 
 	sql := string(bytes.TrimSuffix(body, []byte{0}))
 	if v := h.Statement(wire.Statement{SQL: sql}); v.Deny {
-		s.record(sql, wire.Denied)
+		s.recordDenied(sql)
 
 		return s.respond(readySlot(denial(v)))
 	}
@@ -374,8 +387,8 @@ func (s *session) parse(h wire.Handler, n uint32) error {
 		if err := discard(s.cr, n); err != nil {
 			return err
 		}
-		s.record("", wire.Denied)
-		s.batch = nil
+		s.recordDenied("")
+		s.pendingExecs = nil
 
 		return s.denyBatch(s.tooLarge(n))
 	}
@@ -385,22 +398,76 @@ func (s *session) parse(h wire.Handler, n uint32) error {
 		return err
 	}
 
-	sql, err := parseSQL(body)
+	name, sql, err := parseNameSQL(body)
 	if err != nil {
 		return err
 	}
 
 	if v := h.Statement(wire.Statement{SQL: sql}); v.Deny {
-		s.record(sql, wire.Denied)
-		s.batch = nil // the batch is rejected; earlier allowed statements never run
+		s.recordDenied(sql)
+		s.pendingExecs = nil // the batch is rejected; earlier statements never run
 
 		return s.denyBatch(denial(v))
 	}
-	// Defer recording until Sync: a later denial rejects the whole batch, and an
-	// allowed statement is only real once its batch reaches Sync.
-	s.batch = append(s.batch, sql)
+	// Remember the prepared statement so its later Executes, which carry no SQL,
+	// can be attributed even across batches (driver statement caches reuse it).
+	s.prepared[name] = sql
 
 	return s.stage(typeParse, body)
+}
+
+// bind records which prepared statement a portal is bound to, then stages the
+// message unchanged.
+func (s *session) bind(n uint32) error {
+	if s.denied {
+		return discard(s.cr, n)
+	}
+	if s.forwarded || int64(n) > maxPending {
+		if err := s.forwardPending(); err != nil {
+			return err
+		}
+		s.forwarded = true
+
+		return forward(s.uw, typeBind, n, s.cr) // too large to inspect; skip the portal map
+	}
+
+	body, err := readBody(s.cr, n)
+	if err != nil {
+		return err
+	}
+	if portal, stmt, ok := parseBind(body); ok {
+		s.portals[portal] = stmt
+	}
+
+	return s.stage(typeBind, body)
+}
+
+// execute stages an Execute and, when its portal resolves to a known prepared
+// statement, queues that statement's SQL to be recorded at Sync.
+func (s *session) execute(n uint32) error {
+	if s.denied {
+		return discard(s.cr, n)
+	}
+	if s.forwarded || int64(n) > maxPending {
+		if err := s.forwardPending(); err != nil {
+			return err
+		}
+		s.forwarded = true
+
+		return forward(s.uw, typeExecute, n, s.cr)
+	}
+
+	body, err := readBody(s.cr, n)
+	if err != nil {
+		return err
+	}
+	if portal, ok := parsePortal(body); ok {
+		if sql, ok := s.prepared[s.portals[portal]]; ok {
+			s.pendingExecs = append(s.pendingExecs, sql)
+		}
+	}
+
+	return s.stage(typeExecute, body)
 }
 
 func (s *session) buffer(typ byte, n uint32) error {
@@ -479,9 +546,9 @@ func (s *session) sync(n uint32) error {
 
 	answer := slot{forwarded: true}
 	if !s.denied {
-		answer.result = s.recordBatch()
+		answer.execCount = s.enqueueExecs()
 	}
-	s.batch = nil
+	s.pendingExecs = nil
 	s.denied = false
 	s.forwarded = false
 
@@ -495,19 +562,25 @@ func (s *session) sync(n uint32) error {
 	return flush(s.uw)
 }
 
-// recordBatch records the allowed statements accumulated in the current batch.
-// A single-statement batch returns a result so its row count is captured; a
-// multi-statement batch records each statement now, since results cannot be
-// split between them yet.
-func (s *session) recordBatch() wire.Result {
-	if len(s.batch) == 1 {
-		return s.begin(s.batch[0], wire.Allowed)
-	}
-	for _, sql := range s.batch {
-		s.record(sql, wire.Allowed)
+// enqueueExecs starts a record for each Execute in the batch and queues it for
+// the backend to fill with its result. It returns how many records it queued.
+func (s *session) enqueueExecs() int {
+	if len(s.pendingExecs) == 0 {
+		return 0
 	}
 
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := 0
+	for _, sql := range s.pendingExecs {
+		if r := s.begin(sql, wire.Allowed); r != nil {
+			s.execQueue = append(s.execQueue, r)
+			count++
+		}
+	}
+
+	return count
 }
 
 func (s *session) functionCall(n uint32) error {
@@ -532,6 +605,7 @@ func (s *session) functionCall(n uint32) error {
 // session is torn down so the upstream rolls back rather than committing at Sync.
 func (s *session) denyBatch(sl slot) error {
 	s.denied = true
+	s.pendingExecs = nil
 	s.resetPending()
 
 	if s.forwarded {
@@ -643,12 +717,12 @@ func (s *session) readyForQuery(n uint32) error {
 		return fmt.Errorf("read ReadyForQuery: %w", err)
 	}
 
-	// finishing is recorded after the client's ReadyForQuery is flushed and the
-	// lock is released, so a full ledger queue never stalls the response path.
-	var finishing wire.Result
+	// finishing records are Done after the client's ReadyForQuery is flushed and
+	// the lock is released, so a full ledger queue never stalls the response path.
+	var finishing []wire.Result
 	defer func() {
-		if finishing != nil {
-			finishing.Done()
+		for _, r := range finishing {
+			r.Done()
 		}
 	}()
 
@@ -665,8 +739,14 @@ func (s *session) readyForQuery(n uint32) error {
 		return fmt.Errorf("%w: ReadyForQuery without a pending request", errMalformed)
 	}
 
-	finishing = s.queue[0].result
-	s.curResult = nil
+	if r := s.queue[0].result; r != nil {
+		finishing = append(finishing, r) // the simple query's record
+	}
+	if c := s.queue[0].execCount; c > 0 && c <= len(s.execQueue) {
+		finishing = append(finishing, s.execQueue[:c:c]...) // this batch's Execute records
+		s.execQueue = s.execQueue[c:]
+	}
+	s.execIdx = 0
 	s.curCap = nil
 	s.queue = s.queue[1:]
 	s.tx = status[0]
@@ -728,10 +808,10 @@ func (s *session) begin(sql string, decision wire.Decision) wire.Result {
 	return s.recorder.Begin(sql, decision)
 }
 
-// record writes a ledger record for a statement with no result to observe, such
-// as a denial or an extended-protocol Parse.
-func (s *session) record(sql string, decision wire.Decision) {
-	if r := s.begin(sql, decision); r != nil {
+// recordDenied writes a ledger record for a statement the proxy refused, which
+// has no result to observe.
+func (s *session) recordDenied(sql string) {
+	if r := s.begin(sql, wire.Denied); r != nil {
 		r.Done()
 	}
 }
@@ -739,7 +819,6 @@ func (s *session) record(sql string, decision wire.Decision) {
 // describeResult forwards a RowDescription and tells the current result which
 // columns to capture.
 func (s *session) describeResult(n uint32) error {
-	s.curResult = nil
 	s.curCap = nil
 	if !s.recording() {
 		return s.forwardToClient(typeRowDescription, n) // nothing records; stream it
@@ -754,7 +833,6 @@ func (s *session) describeResult(n uint32) error {
 	if err != nil {
 		return err
 	}
-	s.curResult = res
 	if res != nil {
 		s.curCap = res.Columns(columnNames(body))
 	}
@@ -765,7 +843,7 @@ func (s *session) describeResult(n uint32) error {
 // rowResult forwards a DataRow, capturing the requested columns when the result
 // is being recorded.
 func (s *session) rowResult(n uint32) error {
-	if s.curResult == nil || len(s.curCap) == 0 {
+	if len(s.curCap) == 0 {
 		return s.forwardToClient(typeDataRow, n) // stream without materializing
 	}
 
@@ -773,18 +851,27 @@ func (s *session) rowResult(n uint32) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.forwardResult(typeDataRow, body); err != nil {
+	res, err := s.forwardResult(typeDataRow, body)
+	if err != nil {
 		return err
 	}
-	s.curResult.Row(rowValues(body, s.curCap))
+	if res != nil {
+		res.Row(rowValues(body, s.curCap))
+	}
 
 	return nil
 }
 
-// completeResult forwards a CommandComplete and adds its row count to the result.
+// completeResult forwards a CommandComplete, adds its row count to the result,
+// and, in the extended protocol, advances to the next Execute's record.
 func (s *session) completeResult(n uint32) error {
 	if !s.recording() {
-		return s.forwardToClient(typeCommandComplete, n) // nothing records; stream it
+		if err := s.forwardToClient(typeCommandComplete, n); err != nil {
+			return err
+		}
+		s.advanceExec()
+
+		return nil
 	}
 
 	body, err := readBody(s.ur, n)
@@ -799,20 +886,44 @@ func (s *session) completeResult(n uint32) error {
 	if res != nil {
 		res.Complete(commandTag(body))
 	}
+	s.curCap = nil
+	s.advanceExec()
 
 	return nil
 }
 
+// endResult forwards a message that ends a result set without a row count
+// (EmptyQueryResponse, PortalSuspended) and advances the extended-protocol index.
+func (s *session) endResult(typ byte, n uint32) error {
+	if err := s.forwardToClient(typ, n); err != nil {
+		return err
+	}
+	s.curCap = nil
+	s.advanceExec()
+
+	return nil
+}
+
+// advanceExec moves to the next queued Execute record, once the current result
+// set ends. It has no effect for a simple query, whose one record spans every
+// result set and is finalized at ReadyForQuery.
+func (s *session) advanceExec() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.queue) > 0 && s.queue[0].forwarded && !s.queue[0].simple {
+		s.execIdx++
+	}
+}
+
 // forwardResult writes one already-read message to the client and returns the
-// result attached to the request currently being answered, if any.
+// record currently being filled: the simple query's own record, or the extended
+// protocol's current Execute record.
 func (s *session) forwardResult(typ byte, body []byte) (wire.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var res wire.Result
-	if len(s.queue) > 0 && s.queue[0].forwarded {
-		res = s.queue[0].result
-	}
+	res := s.targetLocked()
 	if err := writeMessage(s.cw, typ, body); err != nil {
 		return nil, err
 	}
@@ -820,13 +931,28 @@ func (s *session) forwardResult(typ byte, body []byte) (wire.Result, error) {
 	return res, nil
 }
 
-// recording reports whether the request currently being answered has a result
-// to record, so results are only materialized when the ledger needs them.
+// targetLocked returns the record the current upstream result feeds. Callers hold mu.
+func (s *session) targetLocked() wire.Result {
+	if len(s.queue) == 0 || !s.queue[0].forwarded {
+		return nil
+	}
+	if s.queue[0].simple {
+		return s.queue[0].result
+	}
+	if s.execIdx < len(s.execQueue) {
+		return s.execQueue[s.execIdx]
+	}
+
+	return nil
+}
+
+// recording reports whether the current upstream result has a record to fill,
+// so results are only materialized when the ledger needs them.
 func (s *session) recording() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return len(s.queue) > 0 && s.queue[0].forwarded && s.queue[0].result != nil
+	return s.targetLocked() != nil
 }
 
 // finishInFlight finalizes the records of forwarded requests still queued when
@@ -839,7 +965,9 @@ func (s *session) finishInFlight() {
 			pending = append(pending, sl.result)
 		}
 	}
+	pending = append(pending, s.execQueue...)
 	s.queue = nil
+	s.execQueue = nil
 	s.mu.Unlock()
 
 	for _, r := range pending {
@@ -917,20 +1045,44 @@ func readySlot(sl slot) slot {
 	return sl
 }
 
-// parseSQL returns the query text from a Parse message body, which is the
-// statement name followed by the SQL, both null-terminated.
-func parseSQL(body []byte) (string, error) {
-	_, rest, err := cstring(body)
+// parseNameSQL returns the prepared statement name and query text from a Parse
+// message body: the name and the SQL, both null-terminated.
+func parseNameSQL(body []byte) (name, sql string, err error) {
+	name, rest, err := cstring(body)
 	if err != nil {
-		return "", fmt.Errorf("parse message: %w", err)
+		return "", "", fmt.Errorf("parse message: %w", err)
 	}
 
-	sql, _, err := cstring(rest)
+	sql, _, err = cstring(rest)
 	if err != nil {
-		return "", fmt.Errorf("parse message: %w", err)
+		return "", "", fmt.Errorf("parse message: %w", err)
 	}
 
-	return sql, nil
+	return name, sql, nil
+}
+
+// parseBind returns the portal and prepared statement names from a Bind body.
+func parseBind(body []byte) (portal, stmt string, ok bool) {
+	portal, rest, err := cstring(body)
+	if err != nil {
+		return "", "", false
+	}
+	stmt, _, err = cstring(rest)
+	if err != nil {
+		return "", "", false
+	}
+
+	return portal, stmt, true
+}
+
+// parsePortal returns the portal name from an Execute body.
+func parsePortal(body []byte) (string, bool) {
+	portal, _, err := cstring(body)
+	if err != nil {
+		return "", false
+	}
+
+	return portal, true
 }
 
 func parseStartup(body []byte) (wire.Startup, error) {
