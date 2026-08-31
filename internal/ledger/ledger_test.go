@@ -16,8 +16,6 @@ import (
 func TestGuardRecordsStatements(t *testing.T) {
 	t.Parallel()
 
-	defer ledger.SetNow(func() string { return "2026-08-27T00:00:00Z" })()
-
 	var buf bytes.Buffer
 	inner := wire.GuardFunc(func(s wire.Startup) wire.Enforcement {
 		return wire.Enforcement{
