@@ -643,6 +643,15 @@ func (s *session) readyForQuery(n uint32) error {
 		return fmt.Errorf("read ReadyForQuery: %w", err)
 	}
 
+	// finishing is recorded after the client's ReadyForQuery is flushed and the
+	// lock is released, so a full ledger queue never stalls the response path.
+	var finishing wire.Result
+	defer func() {
+		if finishing != nil {
+			finishing.Done()
+		}
+	}()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -656,9 +665,7 @@ func (s *session) readyForQuery(n uint32) error {
 		return fmt.Errorf("%w: ReadyForQuery without a pending request", errMalformed)
 	}
 
-	if r := s.queue[0].result; r != nil {
-		r.Done()
-	}
+	finishing = s.queue[0].result
 	s.curResult = nil
 	s.curCap = nil
 	s.queue = s.queue[1:]
