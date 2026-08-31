@@ -11,14 +11,16 @@ import (
 )
 
 // Sink appends records as JSON lines, chaining each record's hash to the
-// previous so the log is tamper-evident. Writes are queued to a single writer
-// goroutine, so a slow disk never blocks a session's response path or serializes
-// sessions against each other.
+// previous so the log is tamper-evident. Records are queued to a single writer
+// goroutine and never dropped, so disk latency does not block a session's
+// response path until the queue fills, after which Write blocks (backpressure)
+// rather than dropping a record.
 type Sink struct {
 	ch     chan Record
 	done   chan struct{}
 	w      writer
 	key    []byte
+	keyID  string
 	logger *slog.Logger
 
 	mu   sync.Mutex
@@ -54,6 +56,7 @@ func NewSink(w writer, opts Options) *Sink {
 		done:   make(chan struct{}),
 		w:      w,
 		key:    opts.Key,
+		keyID:  keyID(opts.Key),
 		logger: logger,
 		prev:   opts.Prev,
 	}
@@ -87,6 +90,7 @@ func (s *Sink) run() {
 	defer close(s.done)
 
 	for rec := range s.ch {
+		rec.KeyID = s.keyID
 		rec.PrevHash = s.prev
 		rec.Hash = s.hashRecord(rec)
 
@@ -104,6 +108,18 @@ func (s *Sink) run() {
 
 		s.setPrev(rec.Hash)
 	}
+}
+
+// keyID is a short, non-reversible name for a chain key: a prefix of its hash,
+// or empty when unkeyed.
+func keyID(key []byte) string {
+	if len(key) == 0 {
+		return ""
+	}
+
+	sum := sha256.Sum256(key)
+
+	return hex.EncodeToString(sum[:6])
 }
 
 // hashRecord hashes the record with its Hash field cleared, so the chain covers

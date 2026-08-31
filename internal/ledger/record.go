@@ -17,6 +17,10 @@ type Record struct {
 	Fingerprint string        `json:"fingerprint"`
 	Decision    wire.Decision `json:"decision"`
 	Rows        int           `json:"rows"`
+	// KeyID names the chain key (a prefix of its hash, empty when unkeyed), so a
+	// verifier knows which key each record was signed with and can see where the
+	// key changed across restarts.
+	KeyID string `json:"key_id,omitempty"`
 	// PrevHash and Hash chain the records; Hash covers this record and PrevHash.
 	PrevHash string `json:"prev_hash"`
 	Hash     string `json:"hash"`

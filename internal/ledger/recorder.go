@@ -1,11 +1,29 @@
 package ledger
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 
 	"github.com/mickamy/rollcall/internal/sqlscan"
 	"github.com/mickamy/rollcall/internal/wire"
 )
+
+// maxFingerprint bounds a record's fingerprint so a connected agent cannot grow
+// the ledger a statement at a time. A longer fingerprint is truncated and given
+// a hash suffix, so distinct large statements still differ.
+const maxFingerprint = 4096
+
+func fingerprint(sql string) string {
+	fp := sqlscan.Fingerprint(sql)
+	if len(fp) <= maxFingerprint {
+		return fp
+	}
+
+	sum := sha256.Sum256([]byte(fp))
+
+	return fp[:maxFingerprint] + "…#" + hex.EncodeToString(sum[:8])
+}
 
 // Guard wraps another guard, recording each session's statements to Sink.
 type Guard struct {
@@ -72,7 +90,7 @@ func (r recorder) Begin(sql string, decision wire.Decision) wire.Result {
 		Database:    r.principal.Database,
 		Application: r.principal.Application,
 		Kind:        kind,
-		Fingerprint: sqlscan.Fingerprint(sql),
+		Fingerprint: fingerprint(sql),
 		Decision:    decision,
 	}
 
