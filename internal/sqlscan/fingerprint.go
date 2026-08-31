@@ -85,9 +85,20 @@ func fingerprintToken(sql string, i int) (int, string) {
 	}
 }
 
+// skipNumber consumes a numeric literal, including hex/binary/octal prefixes
+// (0x1F), digit-group underscores (1_000), decimals, and scientific notation
+// (1.5e-9), so no fragment survives as an identifier.
 func skipNumber(s string, i int) int {
-	for i < len(s) && (isDigit(s[i]) || s[i] == '.' || s[i] == 'e' || s[i] == 'E') {
-		i++
+	for i < len(s) {
+		c := s[i]
+		switch {
+		case isWordPart(c) || c == '.':
+			i++
+		case (c == '+' || c == '-') && i > 0 && (s[i-1] == 'e' || s[i-1] == 'E'):
+			i++
+		default:
+			return i
+		}
 	}
 
 	return i
